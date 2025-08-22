@@ -1,4 +1,4 @@
-# PIA SCRAP: Novelpia → EPUB Scraper (Playwright)
+# PIA SCRAP: Novelpia → EPUB Scraper
 
 Turn a Novelpia novel page (e.g. `https://global.novelpia.com/novel/1213`) into a clean **EPUB** with chapter titles, status, metadata, and cover.
 
@@ -85,7 +85,7 @@ python novelpia_epub.py --url <NOVEL_URL> [--cookies-txt cookies.txt] [--cookies
 
 ---
 
-## 🧠 How it Works (Discovery)
+## 🧠 How it Works
 
 1. Loads the novel page and extracts metadata (title, author, tags, **status**).
 2. Reads the ToC in `.ch-list-section`, which shows **20 items per page** with a `.pagination` bar.
@@ -149,7 +149,7 @@ python novelpia_epub.py --url <NOVEL_URL> [--cookies-txt cookies.txt] [--cookies
 
 ---
 
-## ✅ Example Session (abridged)
+## ✅ Example Session
 
 ```
 [auth] loaded 6 cookies from cookies.txt
