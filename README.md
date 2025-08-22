@@ -38,7 +38,7 @@ python -m playwright install chromium
 
 ## 🚀 Quick Start
 
-1. Save the script as `novelpia_epub.py`
+1. Clone the repository.
 
 2. (Recommended) Export your **cookies** so the script can open free/ad-gated chapters you can view in your browser.
 
