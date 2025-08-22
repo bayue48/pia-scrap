@@ -385,7 +385,7 @@ async def scroll_chapter_list(page: Page, *args, **kwargs):
     return
 
 
-async def collect_chapters_from_section(page: Page, novel_url: str) -> List[Chapter]:
+async def collect_chapters_from_section(page: Page, novel_url: str, cap: Optional[int] = None) -> List[Chapter]:
     chapters: List[Chapter] = []
     seen = set()
 
@@ -470,10 +470,16 @@ async def collect_chapters_from_section(page: Page, novel_url: str) -> List[Chap
             if url and "/viewer/" in url and url not in seen:
                 seen.add(url)
                 chapters.append(Chapter(idx=len(chapters)+1, title=pretty_title, url=url))
-                print(f"[toc]  + {pretty_title} -> {url}")
+                # EARLY STOP
+                if cap and len(chapters) >= cap:
+                    return chapters
 
         # Move to the next page number if known; else try next visible numeric or ›
         if total_pages and cur >= total_pages:
+            break
+
+        # EARLY STOP on page loop too
+        if cap and len(chapters) >= cap:
             break
 
         # Prefer next numeric button (current + 1)
@@ -509,15 +515,15 @@ async def collect_chapters_from_section(page: Page, novel_url: str) -> List[Chap
     return chapters
 
 
-async def collect_chapters(page: Page, novel_url: str) -> List[Chapter]:
-    # Primary: paginated virtual list
-    primary = await collect_chapters_from_section(page, novel_url)
+async def collect_chapters(page: Page, novel_url: str, cap: Optional[int] = None) -> List[Chapter]:
+    primary = await collect_chapters_from_section(page, novel_url, cap=cap)
     if primary:
         return primary
+    # ... fallbacks ...
+    # In each fallback add:
+    # if cap and len(chapters) >= cap: return chapters
+    return Chapter
 
-    # Fallbacks (keep your previous anchor/ARIA/onclick heuristics here)
-    # … (no changes needed if you already have them) …
-    return []
 
 
 # --------- Walking via Next (fallback when no TOC) ---------
@@ -603,11 +609,74 @@ async def walk_next_chapters(page: Page, start_url: str, max_steps: int = 300) -
     return chapters
 
 
+def _rm_all(soup, selectors):
+    for sel in selectors:
+        for el in soup.select(sel):
+            el.decompose()
+
+def _strip_comment_blocks(node_or_soup):
+    """
+    Remove Novelpia's comment UI and leftovers (timestamps, 'There are no comments', etc.).
+    Works on either a BeautifulSoup soup or a Tag node.
+    """
+    import re as _re
+    root = node_or_soup
+
+    # 1) Known containers & classes from the site
+    _rm_all(root, [
+        ".comment-all-wrapper",
+        ".comment-header",
+        ".comment-write-box",
+        ".comment-list-wrapper",
+        ".cmtbox",
+        ".comment-txt",
+        ".comment-action-btn",
+        ".reply-write-input",
+        ".btn-reply-input",
+        ".user-info",
+        ".user-nic",
+        ".input-date",
+        ".nv-comments",
+        ".comments",
+        ".comment",
+        "#comments",
+        "#comment",
+        "[data-comments]",
+        "[data-comment]",
+    ])
+
+    # 2) Generic: any element whose class/id contains comment/reply
+    def is_commentish(tag):
+        if not getattr(tag, "attrs", None): return False
+        cid = " ".join(tag.get("class", [])).lower()
+        tid = (tag.get("id") or "").lower()
+        return ("comment" in cid or "reply" in cid or "comment" in tid or "reply" in tid)
+
+    for el in list(root.find_all(lambda t: t.name in ("div","section","ul","ol","aside","article") and is_commentish(t))):
+        el.decompose()
+
+    # 3) Remove obvious stubs/timestamps that sometimes survive
+    pat_no_comments = _re.compile(r"^\s*(there (are )?no comments|no comments)\s*$", _re.I)
+    pat_timestamp = _re.compile(
+        r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},\s+\d{4}\s+at\s+\d{1,2}:\d{2}\s*(am|pm)\s*$",
+        _re.I,
+    )
+    for el in list(root.find_all(["p","div","li"])):
+        txt = (el.get_text(" ", strip=True) or "")
+        if pat_no_comments.match(txt) or pat_timestamp.match(txt) or txt.strip() in {"HOT","NEWEST","ADD"}:
+            # drop enclosing item if it looks like a comment row
+            parent = el.find_parent(["li","article","div","section"]) or el
+            parent.decompose()
+
+
 # --------- Content extraction & EPUB ---------
 def extract_readable(html: str, list_title: str = "", novel_title: Optional[str] = None) -> Dict[str, str]:
     soup = BeautifulSoup(html, "html.parser")
 
-    # find main reading container
+    # nuke comment UI anywhere on the page first
+    _strip_comment_blocks(soup)
+
+    # find the main reading container
     containers = [
         "[id*='viewer']", ".viewer", ".view-contents", ".read-contents",
         "article", ".article", ".reader", ".chapter", ".prose",
@@ -615,47 +684,49 @@ def extract_readable(html: str, list_title: str = "", novel_title: Optional[str]
     ]
     node = None
     for sel in containers:
-        node = soup.select_one(sel)
-        if node and len(node.get_text(strip=True)) > 200:
+        cand = soup.select_one(sel)
+        if cand and len(cand.get_text(strip=True)) > 200:
+            node = cand
             break
 
-    # try to extract an in-page chapter header
-    header_title = ""
-    if node:
-        for sel in [".chapter-title", ".ep-title", ".title", "header h1", "h1", "h2"]:
-            h = node.select_one(sel)
-            if h:
-                header_title = h.get_text(" ", strip=True)
-                if header_title:
-                    break
-
-    # decide the final title
-    def is_good(t: str) -> bool:
-        if not t:
-            return False
-        s = t.strip()
-        if s.lower().startswith("novelpia -"):
-            return False
-        if novel_title and s.strip() == novel_title.strip():
-            return False
-        # if it's too generic or very short, reject
-        if len(s) < 4:
-            return False
-        return True
-
-    final_title = header_title if is_good(header_title) else (list_title or header_title or "Chapter")
-
-    # body HTML
-    if node:
-        body_html = "".join(str(x) for x in node.contents)
-    else:
-        # paragraph fallback
+    # fallback to stitched paragraphs
+    if not node:
         paras = [p.get_text(" ", strip=True) for p in soup.select("p") if len(p.get_text(strip=True)) > 10]
         if not paras:
             raise RuntimeError("No readable content found (might be gated).")
         from html import escape as hesc
         body_html = "".join(f"<p>{hesc(t)}</p>" for t in paras)
+        page_title = soup.title.get_text(strip=True) if soup.title else ""
+        def is_good(t: str) -> bool:
+            if not t: return False
+            s = t.strip()
+            if s.lower().startswith("novelpia -"): return False
+            if novel_title and s.strip() == novel_title.strip(): return False
+            return len(s) >= 4
+        final_title = list_title or (page_title if is_good(page_title) else "Chapter")
+        return {"title": final_title, "html": body_html}
 
+    # extra safety: strip comment bits inside the node too
+    _strip_comment_blocks(node)
+
+    # try to extract an in-page chapter header
+    header_title = ""
+    for sel in [".chapter-title", ".ep-title", ".title", "header h1", "h1", "h2"]:
+        h = node.select_one(sel)
+        if h:
+            header_title = h.get_text(" ", strip=True)
+            if header_title:
+                break
+
+    def is_good(t: str) -> bool:
+        if not t: return False
+        s = t.strip()
+        if s.lower().startswith("novelpia -"): return False
+        if novel_title and s.strip() == novel_title.strip(): return False
+        return len(s) >= 4
+
+    final_title = header_title if is_good(header_title) else (list_title or header_title or "Chapter")
+    body_html = "".join(str(x) for x in node.contents)
     return {"title": final_title, "html": body_html}
 
 
@@ -773,7 +844,7 @@ async def main():
 
         # Discover chapters (virtual list aware)
         print("[stage] collecting chapters…")
-        chapters = await collect_chapters(page, novel_url=args.url)
+        chapters = await collect_chapters(page, novel_url=args.url, cap=(args.max_chapters or None))
         print(f"[stage] collected {len(chapters)} entries from TOC")
         print(f"[ok] discovered {len(chapters)} potential entries")
 
@@ -826,7 +897,8 @@ async def main():
                     pass
 
             if start_url and "/viewer/" in start_url:
-                walked = await walk_next_chapters(page, start_url=start_url, max_steps=300)
+                lim = args.max_chapters if args.max_chapters and args.max_chapters > 0 else 300
+                walked = await walk_next_chapters(page, start_url=start_url, max_steps=lim)
                 if walked:
                     chapters = walked
                     print(f"[ok] walked {len(chapters)} chapters via Next")
