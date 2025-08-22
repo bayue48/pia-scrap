@@ -9,7 +9,7 @@ Turn a Novelpia novel page (e.g. `https://global.novelpia.com/novel/1213`) into 
 ## ✨ Features
 
 * **EPUB output** with About page, ToC, per‑chapter files.
-* **Correct novel title & status** (reads `.nv-stat-badge`).
+* **Correct novel title & status**.
 * **Cover image** (from `og:image` / fallbacks) set as EPUB cover and shown on About page.
 * **Chapter discovery** from Novelpia’s **paginated list**:
 
