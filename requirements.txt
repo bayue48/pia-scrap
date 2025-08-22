@@ -1,0 +1,5 @@
+playwright
+beautifulsoup4
+python-slugify
+ebooklib
+httpx
