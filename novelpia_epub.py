@@ -2,17 +2,18 @@ import argparse
 import asyncio
 import json
 import re
+import httpx
+import math
+
 from dataclasses import dataclass, asdict
 from html import escape as hesc
 from pathlib import Path
-from typing import List, Optional, Dict, Any
-
-import httpx
+from typing import Optional, List, Dict, Any
 from bs4 import BeautifulSoup
 from slugify import slugify
 from playwright.async_api import async_playwright, Browser, Page, TimeoutError as PWTimeout
 from ebooklib import epub
-import math
+
 
 async def get_total_chapters(page: Page) -> Optional[int]:
     try:
