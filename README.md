@@ -95,7 +95,7 @@ python novelpia_epub.py --url <NOVEL_URL> [--cookies-txt cookies.txt] [--cookies
    * **Clicks the item** to open its `/viewer/<id>` page, captures the URL, then `go_back()` to the same ToC page.
 4. If no ToC is found (rare), falls back to anchor/ARIA/onclick scanning and, as a last resort, enters a reader page and **walks Next**.
 5. Fetches only `/viewer/` pages, pulls the reading container HTML, and writes an EPUB.
-6. **Chapter titles** in the EPUB sidebar are taken from the **ToC list title** by default (so you don’t get repeated “Novelpia – …”).
+6. **Chapter titles** in the EPUB sidebar are taken from the **ToC list title** by default.
 
 ---
 
