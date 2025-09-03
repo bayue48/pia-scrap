@@ -7,7 +7,7 @@ import math
 from dataclasses import dataclass, asdict
 from html import escape as hesc
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Set, Tuple
+from typing import Optional, List, Dict, Any, Set
 from bs4 import BeautifulSoup
 from slugify import slugify
 from playwright.async_api import async_playwright, Browser, Page, TimeoutError as PWTimeout
@@ -776,7 +776,7 @@ async def build_epub(novel: NovelMeta, chapters_payload: List[Dict], out_dir: Pa
         spine.append(chap)
         toc.append(epub.Link(file_name, title, f"ch{idx}"))
 
-    book.toc = Tuple(toc)
+    book.toc = tuple(toc)
     book.spine = spine
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
