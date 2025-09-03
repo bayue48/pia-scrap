@@ -55,7 +55,7 @@ python -m playwright install chromium
 3. Run:
 
 ```bash
-python novelpia_epub.py --url https://global.novelpia.com/novel/1213 --cookies-txt cookies.txt
+python pia.py --url https://global.novelpia.com/novel/1213 --cookies-txt cookies.txt
 ```
 
 Output:
@@ -71,8 +71,8 @@ output/<novel-slug>/chapters.jsonl
 ## 🔧 CLI
 
 ```
-python novelpia_epub.py --url <NOVEL_URL> [--cookies-txt cookies.txt] [--cookies-json storage.json]
-                        [--out output] [--max-chapters N]
+python pia.py --url <NOVEL_URL> [--cookies-txt cookies.txt] [--cookies-json storage.json]
+                        [--out output] [--max-chapters N] [--no-headless]
 ```
 
 **Arguments**
@@ -82,6 +82,7 @@ python novelpia_epub.py --url <NOVEL_URL> [--cookies-txt cookies.txt] [--cookies
 * `--cookies-json` — Playwright/Chrome storageState JSON; may include HttpOnly cookies.
 * `--out` — Output folder (default: `output`).
 * `--max-chapters` — Optional limit (useful for testing), e.g. `--max-chapters 10`.
+* `--no-headless` — For Debugging (show the real browser window instead of running it hidden).
 
 ---
 
