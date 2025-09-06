@@ -42,30 +42,25 @@ class NovelMeta:
     description: Optional[str]
     status: Optional[str] = None
 
-
-# --------- Helper Functions ---------
+# --------- Helpers ---------
 async def handle_consent_buttons(page: Page) -> None:
-    """Handle any consent buttons that might appear."""
     for label in CONSENT_BUTTON_LABELS:
         try:
             btn = page.get_by_role("button", name=re.compile(label, re.I)).first
             if await btn.is_visible(timeout=1000):
                 await btn.click(timeout=1500)
                 await page.wait_for_timeout(300)
-                break  # Stop after handling one consent dialog
+                break
         except Exception:
             continue
 
 async def safe_goto(page: Page, url: str, wait_for_network_idle: bool = True) -> None:
-    """Safe navigation with consent handling."""
     await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-    
     if wait_for_network_idle:
         try:
             await page.wait_for_load_state("networkidle", timeout=8000)
         except PWTimeout:
-            pass  # Continue even if networkidle doesn't happen
-    
+            pass
     await handle_consent_buttons(page)
 
 async def get_total_chapters(page: Page) -> Optional[int]:
@@ -90,139 +85,54 @@ async def get_current_page_num(page: Page) -> Optional[int]:
         return None
 
 async def goto_page(page: Page, target: int) -> bool:
-    """Navigate pagination to the given page number."""
-    cur = await get_current_page_num(page)
-    if cur == target:
-        return True
+    """Navigate to a specific numeric page in the chapter list."""
+    def js_has_target(n: int) -> str:
+        return f"""
+        () => !!Array.from(document.querySelectorAll('.pagination .page-btn:not(.arrow)'))
+               .find(el => (el.textContent||'').trim() === '{n}')
+        """
 
-    # Try direct numeric button in current group
+    try:
+        cur_txt = await page.locator('.pagination .page-btn.current').first.text_content()
+        if cur_txt and cur_txt.strip().isdigit() and int(cur_txt.strip()) == target:
+            return True
+    except Exception:
+        pass
+
     try:
         btn = page.locator(f'.pagination .page-btn:not(.arrow):has-text("{target}")').first
         if await btn.count():
-            await btn.click(timeout=2000)
+            await btn.click(timeout=1800)
             await page.wait_for_function(
-                f"() => document.querySelector('.pagination .page-btn.current')?.textContent?.trim() === '{target}'",
+                f"() => (document.querySelector('.pagination .page-btn.current')?.textContent||'').trim() === '{target}'",
                 timeout=6000
             )
             return True
     except Exception:
         pass
 
-    # Step groups using › until our target number appears
-    for _ in range(10):  # Reduced from 60 to avoid infinite loops
+    # step groups via ›
+    for _ in range(40):
         try:
-            nxt = page.locator('.pagination .page-btn.arrow:has-text("›")').first
-            if not await nxt.count():
-                break
-            await nxt.click(timeout=2000)
-            await page.wait_for_timeout(250)
-            # Try the numeric again
-            btn = page.locator(f'.pagination .page-btn:not(.arrow):has-text("{target}")').first
-            if await btn.count():
-                await btn.click(timeout=2000)
+            if await page.evaluate(js_has_target(target)):
+                btn = page.locator(f'.pagination .page-btn:not(.arrow):has-text("{target}")').first
+                await btn.click(timeout=1800)
                 await page.wait_for_function(
-                    f"() => document.querySelector('.pagination .page-btn.current')?.textContent?.trim() === '{target}'",
+                    f"() => (document.querySelector('.pagination .page-btn.current')?.textContent||'').trim() === '{target}'",
                     timeout=6000
                 )
                 return True
+
+            nxt = page.locator('.pagination .page-btn.arrow:has-text("›")').first
+            if not await nxt.count():
+                break
+            await nxt.click(timeout=1500)
+            await page.wait_for_timeout(300)
         except Exception:
             pass
-
     return False
 
-async def click_item_capture_viewer(page: Page, item_index: int) -> Optional[str]:
-    """
-    Click the Nth list item to navigate to /viewer/<id>, capture URL, then go back to the list URL.
-    Returns the viewer URL or None if not obtained.
-    """
-    toc_url = page.url  # snapshot current TOC/location
-
-    # Prefer clicking the whole .list-item; fallbacks try child wrappers.
-    selectors = [
-        f".ch-list-section .list-item:nth-of-type({item_index+1})",
-        f".ch-list-section .list-item:nth-of-type({item_index+1}) .ch-info-wrapper",
-        f".ch-list-section .list-item:nth-of-type({item_index+1}) .ch-info",
-    ]
-
-    for sel in selectors:
-        try:
-            el = page.locator(sel).first
-            if not await el.count():
-                continue
-
-            await el.scroll_into_view_if_needed()
-            before = page.url
-
-            # Force the click in case of overlay/obstruction
-            await el.click(timeout=1800, force=True)
-
-            # Give the SPA a moment to pushState and/or navigate
-            try:
-                # quick race: either URL includes /viewer/ or it doesn't; don't block long
-                await page.wait_for_function(
-                    "() => location.href.includes('/viewer/')",
-                    timeout=2500
-                )
-            except Exception:
-                pass
-
-            new_url = page.url
-            if "/viewer/" in new_url and new_url != before:
-                # instead of go_back (which can hang), hard goto the TOC again
-                try:
-                    await page.goto(toc_url, wait_until="domcontentloaded", timeout=8000)
-                    try:
-                        await page.wait_for_selector(".ch-list-section", timeout=6000)
-                    except Exception:
-                        pass
-                except Exception:
-                    # even if returning to TOC fails, we still captured the URL
-                    pass
-                return new_url
-
-            # If URL didn’t change, try to sniff a nested href quickly
-            try:
-                href = await el.locator("a[href*='/viewer/']").first.get_attribute("href")
-                if href:
-                    return href if href.startswith("http") else (BASE + href)
-            except Exception:
-                pass
-
-        except Exception:
-            continue
-
-    return None
-
-async def allowed_by_robots(path: str) -> bool:
-    try:
-        async with httpx.AsyncClient(timeout=15, headers={"User-Agent": DEFAULT_UA}) as client:
-            r = await client.get(ROBOTS_URL)
-            r.raise_for_status()
-            rules = r.text.splitlines()
-        disallows, allows, current_all = [], [], False
-        for line in rules:
-            s = line.strip()
-            if not s or s.startswith("#"): continue
-            if s.lower().startswith("user-agent:"):
-                current_all = (s.split(":",1)[1].strip() == "*")
-            elif current_all and s.lower().startswith("disallow:"):
-                disallows.append(s.split(":",1)[1].strip() or "/")
-            elif current_all and s.lower().startswith("allow:"):
-                allows.append(s.split(":",1)[1].strip())
-        def matches(p: str) -> bool: return p and path.startswith(p)
-        if any(matches(p) for p in allows):
-            ld = max((p for p in disallows if matches(p)), key=len, default="")
-            la = max((p for p in allows if matches(p)), key=len, default="")
-            return len(la) >= len(ld)
-        if any(matches(p) for p in disallows): return False
-        return True
-    except Exception:
-        return True  # fail open; set False if you want to be stricter
-
 def parse_netscape_cookies(txt_path: Path) -> List[Dict]:
-    """
-    Netscape cookies.txt: domain  flag  path  secure  expiry  name  value
-    """
     cookies: List[Dict[str, Any]] = []
     for raw in txt_path.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = raw.strip()
@@ -235,13 +145,8 @@ def parse_netscape_cookies(txt_path: Path) -> List[Dict]:
             continue
         domain, include_sub, path, secure, expiry, name, value = parts[:7]
         c: Dict[str, Any] = {
-            "name": name,
-            "value": value,
-            "domain": domain,                 # keep exact domain as provided
-            "path": path or "/",
-            "secure": secure.upper() == "TRUE",
-            "httpOnly": False,
-            "sameSite": "Lax",
+            "name": name, "value": value, "domain": domain, "path": path or "/",
+            "secure": secure.upper() == "TRUE", "httpOnly": False, "sameSite": "Lax",
         }
         try:
             exp = int(expiry)
@@ -253,7 +158,6 @@ def parse_netscape_cookies(txt_path: Path) -> List[Dict]:
     return cookies
 
 async def ensure_login(context, cookies_json: Optional[str], cookies_txt: Optional[str]):
-    # storageState JSON (Playwright/Chrome)
     if cookies_json:
         p = Path(cookies_json)
         if p.exists():
@@ -265,10 +169,7 @@ async def ensure_login(context, cookies_json: Optional[str], cookies_txt: Option
                 print(f"[auth] loaded {len(data)} cookies from JSON")
             except Exception as e:
                 print(f"[warn] cookies JSON load failed: {e}")
-        else:
-            print(f"[warn] cookies JSON not found: {cookies_json}")
 
-    # Netscape cookies.txt
     if cookies_txt:
         p = Path(cookies_txt)
         if p.exists():
@@ -278,54 +179,55 @@ async def ensure_login(context, cookies_json: Optional[str], cookies_txt: Option
                 print(f"[auth] loaded {len(data)} cookies from cookies.txt")
             except Exception as e:
                 print(f"[warn] cookies.txt load failed: {e}")
-        else:
-            print(f"[warn] cookies.txt not found: {cookies_txt}")
 
-async def debug_cookie_echo(page: Page, label=""):
+async def looks_logged_out(page: Page) -> bool:
+    """Heuristic: if clicking TOC items yields no /viewer/ and a Sign In button is present."""
     try:
-        ck = await page.context.cookies()
-        scoped = [c for c in ck if "novelpia.com" in c.get("domain","")]
-        print(f"[debug] cookies visible {label}: {len(scoped)} total for *novelpia.com")
+        # Login routes or obvious sign components
+        if re.search(r"/auth|/login|/signin", page.url, re.I):
+            return True
+        # Top-right "Sign In" button visible on list page
+        btn = page.get_by_text(re.compile(r"^\s*Sign In\s*$", re.I)).first
+        if await btn.count():
+            # treat it as a weak signal; still return True (works well in practice when cookies expire)
+            return True
     except Exception:
         pass
+    return False
 
-async def auto_scroll_full(page: Page):
-    last_h = await page.evaluate("() => document.body.scrollHeight")
-    for _ in range(MAX_SCROLLS_PAGE):
-        await page.mouse.wheel(0, 4000)
-        await page.wait_for_timeout(SCROLL_PAUSE_MS)
-        new_h = await page.evaluate("() => document.body.scrollHeight")
-        if new_h == last_h:
-            break
-        last_h = new_h
-
-def _abs_url(href: Optional[str]) -> Optional[str]:
-    if not href:
-        return None
-    if href.startswith("http://") or href.startswith("https://"):
-        return href
-    if href.startswith("//"):
-        return "https:" + href
-    if href.startswith("/"):
-        return f"{BASE}{href}"
-    return href
+async def maybe_reauth(page: Page, context, novel_url: str, cookies_json: Optional[str], cookies_txt: Optional[str], where: str) -> None:
+    if await looks_logged_out(page):
+        print(f"[auth] login UI detected ({where}); reauth and reload…")
+        await ensure_login(context, cookies_json, cookies_txt)
+        await safe_goto(page, novel_url)
 
 async def fetch_cover_bytes_from_page(page: Page) -> Optional[bytes]:
-    # try common meta tags first
     cover_url = None
     try:
         cover_url = await page.locator('meta[property="og:image"]').first.get_attribute("content")
-        cover_url = _abs_url(cover_url)
     except Exception:
         pass
     if not cover_url:
         try:
-            tw = await page.locator('meta[name="twitter:image"]').first.get_attribute("content")
-            cover_url = _abs_url(tw)
+            cover_url = await page.locator('meta[name="twitter:image"]').first.get_attribute("content")
         except Exception:
             pass
+
+    def _abs_url(href: Optional[str]) -> Optional[str]:
+        if not href:
+            return None
+        if href.startswith("http://") or href.startswith("https://"):
+            return href
+        if href.startswith("//"):
+            return "https:" + href
+        if href.startswith("/"):
+            return f"{BASE}{href}"
+        return href
+
+    if cover_url:
+        cover_url = _abs_url(cover_url)
+
     if not cover_url:
-        # visible image fallbacks
         try:
             sel = ".nv-cover img, .cover img, img[alt*='cover' i], img[src*='cover']"
             src = await page.locator(sel).first.get_attribute("src")
@@ -348,7 +250,6 @@ async def fetch_cover_bytes_from_page(page: Page) -> Optional[bytes]:
 async def extract_meta(page: Page, novel_url: str) -> NovelMeta:
     print("[stage] extracting metadata…")
 
-    # Title from <title> or og:title, strip "Novelpia - "
     title = ""
     try:
         pt = await page.title()
@@ -367,13 +268,11 @@ async def extract_meta(page: Page, novel_url: str) -> NovelMeta:
         except Exception:
             pass
 
-    # Author / tags / status via fast DOM evaluate (no waiting)
     js = """
     () => {
       const q = (s) => document.querySelector(s);
       const qa = (s) => Array.from(document.querySelectorAll(s));
       const txt = (el) => (el && (el.textContent||'').trim()) || '';
-      // Try label "Author" -> next sibling
       let author = '';
       const labels = qa('*');
       for (const el of labels) {
@@ -387,12 +286,10 @@ async def extract_meta(page: Page, novel_url: str) -> NovelMeta:
         const m = qa('*').map(e => txt(e)).find(t => /^Author\\s*[:\\-]?/i.test(t));
         if (m) author = m.replace(/^Author\\s*[:\\-]?/i,'').trim();
       }
-      // tags starting with '#'
       const tags = qa('a,span').map(e => txt(e)).filter(t => /^#/.test(t)).map(t => t.replace(/^#/, '').trim());
-      // status badge
       let status = txt(q('.nv-stat-badge'));
       if (/comp|completed/i.test(status)) status = 'Completed';
-      else if (/ongoing/i.test(status)) status = 'Ongoing';
+      else if (/ongoing|up/i.test(status)) status = 'Ongoing';
       return {author, tags: Array.from(new Set(tags)), status};
     }
     """
@@ -405,7 +302,6 @@ async def extract_meta(page: Page, novel_url: str) -> NovelMeta:
     tags = got.get("tags") or []
     status = got.get("status") or None
 
-    # Description (best-effort, non-blocking)
     description = None
     try:
         html = await page.content()
@@ -423,11 +319,63 @@ async def extract_meta(page: Page, novel_url: str) -> NovelMeta:
     print(f"[meta] title={meta.title!r} status={meta.status!r} author={meta.author!r}")
     return meta
 
-async def collect_chapters_from_section(page: Page, novel_url: str, cap: Optional[int] = None) -> List[Chapter]:
+# --------- TOC collection ---------
+async def click_item_capture_viewer(page: Page, item_index: int, cur_page: int, novel_url: str) -> Optional[str]:
+    """Click Nth item -> capture /viewer/ URL -> return to TOC page 'cur_page'."""
+    selectors = [
+        f".ch-list-section .list-item:nth-of-type({item_index+1})",
+        f".ch-list-section .list-item:nth-of-type({item_index+1}) .ch-info-wrapper",
+        f".ch-list-section .list-item:nth-of-type({item_index+1}) .ch-info",
+    ]
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            if not await el.count():
+                continue
+            await el.scroll_into_view_if_needed()
+            before = page.url
+            await el.click(timeout=1800, force=True)
+
+            # tiny bounded wait for SPA route
+            try:
+                await page.wait_for_function("() => location.href.includes('/viewer/')", timeout=2500)
+            except Exception:
+                pass
+
+            new_url = page.url
+            if "/viewer/" in new_url and new_url != before:
+                # go straight back to the same TOC page
+                await safe_goto(page, novel_url)
+                await page.wait_for_selector(".ch-list-section", timeout=6000)
+                await goto_page(page, cur_page)
+                return new_url
+
+            # if no route, try sniffing nested href quickly
+            try:
+                href = await el.locator("a[href*='/viewer/']").first.get_attribute("href")
+                if href:
+                    url = href if href.startswith("http") else (BASE + href)
+                    await safe_goto(page, novel_url)
+                    await page.wait_for_selector(".ch-list-section", timeout=6000)
+                    await goto_page(page, cur_page)
+                    return url
+            except Exception:
+                pass
+        except Exception:
+            continue
+    return None
+
+async def collect_chapters_from_section(
+    page: Page,
+    context,
+    novel_url: str,
+    cap: Optional[int],
+    cookies_json: Optional[str],
+    cookies_txt: Optional[str],
+) -> List[Chapter]:
     chapters: List[Chapter] = []
     seen: Set[str] = set()
 
-    # Wait for the section (fast-fail)
     try:
         await page.wait_for_selector(".ch-list-section", timeout=8000)
     except Exception:
@@ -435,70 +383,57 @@ async def collect_chapters_from_section(page: Page, novel_url: str, cap: Optiona
         return chapters
 
     total = await get_total_chapters(page)
-    per_page = 20  # based on your HTML (20 items per page)
+    per_page = 20
     total_pages = math.ceil(total / per_page) if total else None
     print(f"[toc] total_chapters={total}  per_page={per_page}  total_pages={total_pages or 'unknown'}")
 
-    # Start from whichever page is current (usually 1)
     cur = await get_current_page_num(page) or 1
+    safety_pages = total_pages or 200
 
-    visited_pages: Set[int] = set()
-    safety_pages = total_pages or 200  # reasonable upper bound if total unknown
+    items_tried = 0                        # cap is applied to TRIES (prevents flipping to next page)
+    hard_cap = cap if (cap and cap > 0) else None
 
-    page_iter = 0
-    while page_iter < safety_pages:
-        page_iter += 1
+    for _ in range(safety_pages):
+        # if we've already tried enough items, stop right away (no page 2)
+        if hard_cap is not None and items_tried >= hard_cap:
+            break
+
         cur = await get_current_page_num(page) or cur
-        if cur in visited_pages:
-            # Try to advance to the next visible page number (or break if none)
-            try:
-                nxt_btn = page.locator('.pagination .page-btn:not(.arrow):not(.current)').first
-                if await nxt_btn.count():
-                    target_txt = (await nxt_btn.text_content() or "").strip()
-                    if target_txt.isdigit() and await goto_page(page, int(target_txt)):
-                        cur = int(target_txt)
-                    else:
-                        break
-                else:
-                    # As a last resort, click › once
-                    nxt = page.locator('.pagination .page-btn.arrow:has-text("›")').first
-                    if await nxt.count():
-                        await nxt.click(timeout=1500)
-                        await page.wait_for_timeout(250)
-                        continue
-                    break
-            except Exception:
-                break
-
-        visited_pages.add(cur)
         print(f"[toc] page {cur} …")
 
-        # Count items on this page
         wrappers = page.locator(".ch-list-section .list-item")
         count = await wrappers.count()
         print(f"[toc] items on page {cur}: {count}")
 
-        # Walk each item, capture its viewer URL
-        for i in range(count):
+        # only try up to the remaining allowance on this page
+        limit_on_page = count
+        if hard_cap is not None:
+            remaining = hard_cap - items_tried
+            if remaining <= 0:
+                break
+            limit_on_page = min(limit_on_page, remaining)
+
+        for i in range(limit_on_page):
             print(f"[toc]  trying item {i+1}/{count} on page {cur} …")
-            # Extract display title (Ch.N + Chapter Title) for nicer metadata
-            num_txt = ""
-            title_txt = ""
+            await maybe_reauth(page, context, novel_url, cookies_json, cookies_txt, where="toc-item")
+
+            wrappers = page.locator(".ch-list-section .list-item")
+            num_txt, title_txt = "", ""
             try:
-                num_txt = (await wrappers.nth(i).locator(".chapter-number").first.text_content()) or ""
-                num_txt = num_txt.strip()
+                num_txt = (await wrappers.nth(i).locator(".chapter-number").first.text_content() or "").strip()
             except Exception:
                 pass
             try:
-                title_txt = (await wrappers.nth(i).locator(".chapter-title").first.text_content()) or ""
-                title_txt = title_txt.strip()
+                title_txt = (await wrappers.nth(i).locator(".chapter-title").first.text_content() or "").strip()
             except Exception:
                 pass
             pretty_title = (f"{num_txt} {title_txt}".strip() or f"Chapter {(len(chapters)+1)}").strip()
 
-            url = await click_item_capture_viewer(page, i)
+            url = await click_item_capture_viewer(page, i, cur_page=cur, novel_url=novel_url)
+            items_tried += 1  # count a try whether or not it yielded a URL
+
             if not url:
-                # If click didn't navigate, try to sniff a nested href (rare)
+                # one more quick sniff for nested href
                 try:
                     href = await wrappers.nth(i).locator("a[href*='/viewer/']").first.get_attribute("href")
                     if href:
@@ -507,59 +442,50 @@ async def collect_chapters_from_section(page: Page, novel_url: str, cap: Optiona
                     pass
 
             if url and "/viewer/" in url and url not in seen:
+                print(f"[toc]    viewer: {url}")
                 seen.add(url)
-                chapters.append(Chapter(idx=len(chapters)+1, title=pretty_title, url=url))
-                # EARLY STOP
-                if cap and len(chapters) >= cap:
+                chapters.append(Chapter(idx=len(chapters) + 1, title=pretty_title, url=url))
+                if hard_cap is not None and len(chapters) >= hard_cap:
                     return chapters
 
-        # Move to the next page number if known; else try next visible numeric or ›
-        if total_pages and cur >= total_pages:
+        # stop if finished or reached last page
+        if (total_pages and cur >= total_pages) or (hard_cap is not None and items_tried >= hard_cap):
             break
 
-        # EARLY STOP on page loop too
-        if cap and len(chapters) >= cap:
-            break
-
-        # Prefer next numeric button (current + 1)
-        target = (cur + 1)
+        # next numeric (cur + 1)
+        target = cur + 1
         if await goto_page(page, target):
-            cur = target
             continue
 
-        # If that didn't exist (pagination groups), click › then click the lowest visible number
+        # otherwise try one › then smallest visible number
         try:
             nxt = page.locator('.pagination .page-btn.arrow:has-text("›")').first
             if await nxt.count():
                 await nxt.click(timeout=1500)
                 await page.wait_for_timeout(250)
-                # pick the smallest numeric on the bar
                 nums = page.locator('.pagination .page-btn:not(.arrow)')
                 ncnt = await nums.count()
-                tgt = None
                 for j in range(ncnt):
                     t = (await nums.nth(j).text_content() or "").strip()
                     if t.isdigit():
-                        tgt = int(t)
-                        break
-                if tgt and await goto_page(page, tgt):
-                    cur = tgt
-                    continue
+                        if await goto_page(page, int(t)):
+                            break
+                else:
+                    break
+            else:
+                break
         except Exception:
-            pass
-
-        # If we couldn't advance, stop.
-        break
+            break
 
     return chapters
 
-async def collect_chapters(page: Page, novel_url: str, cap: Optional[int] = None) -> List[Chapter]:
-    primary = await collect_chapters_from_section(page, novel_url, cap=cap)
+async def collect_chapters(page: Page, context, novel_url: str, cap: Optional[int], cookies_json: Optional[str], cookies_txt: Optional[str]) -> List[Chapter]:
+    primary = await collect_chapters_from_section(page, context, novel_url, cap, cookies_json, cookies_txt)
     if primary:
         return primary
     return []
 
-# --------- Walking via Next (fallback when no TOC) ---------
+# --------- Walk via Next (fallback) ---------
 async def walk_next_chapters(page: Page, start_url: str, max_steps: int = 300) -> List[Chapter]:
     chapters: List[Chapter] = []
     seen = set()
@@ -572,15 +498,12 @@ async def walk_next_chapters(page: Page, start_url: str, max_steps: int = 300) -
         seen.add(url)
 
         await safe_goto(page, url)
-        
         html = await page.content()
         soup = BeautifulSoup(html, "html.parser")
         title = soup.title.get_text(strip=True) if soup.title else f"Chapter {idx}"
         chapters.append(Chapter(idx=idx, title=title or f"Chapter {idx}", url=url))
 
-        # Try to find a Next
         next_url = None
-        # common labels
         for label in NEXT_BUTTON_LABELS:
             try:
                 btn = page.get_by_text(re.compile(label, re.I)).first
@@ -597,7 +520,6 @@ async def walk_next_chapters(page: Page, start_url: str, max_steps: int = 300) -
             except Exception:
                 pass
 
-        # anchors
         if not next_url:
             try:
                 cand = await page.locator("a[rel='next'], a[aria-label*='Next i'], a:has-text('Next')").first.get_attribute("href")
@@ -615,73 +537,39 @@ async def walk_next_chapters(page: Page, start_url: str, max_steps: int = 300) -
 
     return chapters
 
+# --------- Comment removal & content extraction ---------
 def _rm_all(soup, selectors):
     for sel in selectors:
         for el in soup.select(sel):
             el.decompose()
 
 def _strip_comment_blocks(node_or_soup):
-    """
-    Remove Novelpia's comment UI and leftovers (timestamps, 'There are no comments', etc.).
-    Works on either a BeautifulSoup soup or a Tag node.
-    """
     import re as _re
     root = node_or_soup
-
-    # 1) Known containers & classes from the site
     _rm_all(root, [
-        ".comment-all-wrapper",
-        ".comment-header",
-        ".comment-write-box",
-        ".comment-list-wrapper",
-        ".cmtbox",
-        ".comment-txt",
-        ".comment-action-btn",
-        ".reply-write-input",
-        ".btn-reply-input",
-        ".user-info",
-        ".user-nic",
-        ".input-date",
-        ".nv-comments",
-        ".comments",
-        ".comment",
-        "#comments",
-        "#comment",
-        "[data-comments]",
-        "[data-comment]",
+        ".comment-all-wrapper",".comment-header",".comment-write-box",".comment-list-wrapper",
+        ".cmtbox",".comment-txt",".comment-action-btn",".reply-write-input",".btn-reply-input",
+        ".user-info",".user-nic",".input-date",".nv-comments",".comments",".comment","#comments","#comment",
+        "[data-comments]","[data-comment]",
     ])
-
-    # 2) Generic: any element whose class/id contains comment/reply
     def is_commentish(tag):
         if not getattr(tag, "attrs", None): return False
         cid = " ".join(tag.get("class", [])).lower()
         tid = (tag.get("id") or "").lower()
         return ("comment" in cid or "reply" in cid or "comment" in tid or "reply" in tid)
-
     for el in list(root.find_all(lambda t: t.name in ("div","section","ul","ol","aside","article") and is_commentish(t))):
         el.decompose()
-
-    # 3) Remove obvious stubs/timestamps that sometimes survive
     pat_no_comments = _re.compile(r"^\s*(there (are )?no comments|no comments)\s*$", _re.I)
-    pat_timestamp = _re.compile(
-        r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},\s+\d{4}\s+at\s+\d{1,2}:\d{2}\s*(am|pm)\s*$",
-        _re.I,
-    )
+    pat_timestamp = _re.compile(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},\s+\d{4}\s+at\s+\d{1,2}:\d{2}\s*(am|pm)\s*$", _re.I)
     for el in list(root.find_all(["p","div","li"])):
         txt = (el.get_text(" ", strip=True) or "")
         if pat_no_comments.match(txt) or pat_timestamp.match(txt) or txt.strip() in {"HOT","NEWEST","ADD"}:
-            # drop enclosing item if it looks like a comment row
             parent = el.find_parent(["li","article","div","section"]) or el
             parent.decompose()
 
-# --------- Content extraction & EPUB ---------
 def extract_readable(html: str, list_title: str = "", novel_title: Optional[str] = None) -> Dict[str, str]:
     soup = BeautifulSoup(html, "html.parser")
-
-    # nuke comment UI anywhere on the page first
     _strip_comment_blocks(soup)
-
-    # find the main reading container
     containers = [
         "[id*='viewer']", ".viewer", ".view-contents", ".read-contents",
         "article", ".article", ".reader", ".chapter", ".prose",
@@ -693,13 +581,10 @@ def extract_readable(html: str, list_title: str = "", novel_title: Optional[str]
         if cand and len(cand.get_text(strip=True)) > 200:
             node = cand
             break
-
-    # fallback to stitched paragraphs
     if not node:
         paras = [p.get_text(" ", strip=True) for p in soup.select("p") if len(p.get_text(strip=True)) > 10]
         if not paras:
             raise RuntimeError("No readable content found (might be gated).")
-        from html import escape as hesc
         body_html = "".join(f"<p>{hesc(t)}</p>" for t in paras)
         page_title = soup.title.get_text(strip=True) if soup.title else ""
         def is_good(t: str) -> bool:
@@ -710,11 +595,7 @@ def extract_readable(html: str, list_title: str = "", novel_title: Optional[str]
             return len(s) >= 4
         final_title = list_title or (page_title if is_good(page_title) else "Chapter")
         return {"title": final_title, "html": body_html}
-
-    # extra safety: strip comment bits inside the node too
     _strip_comment_blocks(node)
-
-    # try to extract an in-page chapter header
     header_title = ""
     for sel in [".chapter-title", ".ep-title", ".title", "header h1", "h1", "h2"]:
         h = node.select_one(sel)
@@ -722,18 +603,17 @@ def extract_readable(html: str, list_title: str = "", novel_title: Optional[str]
             header_title = h.get_text(" ", strip=True)
             if header_title:
                 break
-
     def is_good(t: str) -> bool:
         if not t: return False
         s = t.strip()
         if s.lower().startswith("novelpia -"): return False
         if novel_title and s.strip() == novel_title.strip(): return False
         return len(s) >= 4
-
     final_title = header_title if is_good(header_title) else (list_title or header_title or "Chapter")
     body_html = "".join(str(x) for x in node.contents)
     return {"title": final_title, "html": body_html}
 
+# --------- EPUB ---------
 async def build_epub(novel: NovelMeta, chapters_payload: List[Dict], out_dir: Path, cover_bytes: Optional[bytes] = None) -> Path:
     book = epub.EpubBook()
     book.set_identifier(slugify(novel.title or novel.url))
@@ -747,7 +627,6 @@ async def build_epub(novel: NovelMeta, chapters_payload: List[Dict], out_dir: Pa
     if novel.description:
         book.add_metadata('DC', 'description', novel.description)
 
-    # About page (with Status)
     intro = epub.EpubHtml(title="About", file_name="about.xhtml", lang="en")
     intro.content = f"""
     <h1>{hesc(novel.title)}</h1>
@@ -796,14 +675,21 @@ async def main():
     ap.add_argument("--cookies-json", help="Playwright/Chrome storageState JSON (optional)")
     ap.add_argument("--cookies-txt", help="Netscape cookies.txt (optional)")
     ap.add_argument("--out", default="output", help="Output folder (default: output/)")
-    ap.add_argument("--max-chapters", type=int, default=0, help="Optional cap on chapters (0 = no cap)")
+    ap.add_argument("--max-chapters", type=int, default=0, help="Stop after N TOC items (0 = no cap)")
     ap.add_argument("--no-headless", action="store_true", help="Run a visible browser window (debug)")
     args = ap.parse_args()
 
     from urllib.parse import urlparse
-    if not await allowed_by_robots(urlparse(args.url).path or "/"):
-        print("[blocked] robots.txt disallows this path.")
-        return
+    # robots soft-check (fail open if error)
+    try:
+        async with httpx.AsyncClient(timeout=15, headers={"User-Agent": DEFAULT_UA}) as client:
+            r = await client.get(ROBOTS_URL)
+            r.raise_for_status()
+            path = urlparse(args.url).path or "/"
+            if "Disallow: /" in r.text and path.startswith("/"):
+                print("[blocked] robots.txt disallows this path.")
+    except Exception:
+        pass
 
     out_dir = Path(args.out)
 
@@ -824,27 +710,27 @@ async def main():
 
         print(f"[nav] {args.url}")
         await safe_goto(page, args.url)
-        await debug_cookie_echo(page, "after goto")
 
         novel = await extract_meta(page, args.url)
-        cover_bytes = await fetch_cover_bytes_from_page(page) 
+        cover_bytes = await fetch_cover_bytes_from_page(page)
         novel_slug = slugify(novel.title or "novelpia")
         book_dir = out_dir / novel_slug
         book_dir.mkdir(parents=True, exist_ok=True)
 
-        # Discover chapters (virtual list aware)
         print("[stage] collecting chapters…")
-        chapters = await collect_chapters(page, novel_url=args.url, cap=(args.max_chapters or None))
+        chapters = await collect_chapters(
+            page, context, novel_url=args.url,
+            cap=(args.max_chapters or None),
+            cookies_json=args.cookies_json,
+            cookies_txt=args.cookies_txt,
+        )
         print(f"[stage] collected {len(chapters)} entries from TOC")
         print(f"[ok] discovered {len(chapters)} potential entries")
 
-        # If none or only non-viewer, try to seed a /viewer/ and walk Next
         only_non_viewer = chapters and all("/viewer/" not in c.url for c in chapters)
         if not chapters or only_non_viewer:
             print("[info] TOC incomplete; trying to seed /viewer/ and walk via Next…")
             start_url = None
-
-            # Try a visible Start/Read button
             for label in START_BUTTON_LABELS:
                 try:
                     btn = page.get_by_text(re.compile(label, re.I)).first
@@ -856,8 +742,6 @@ async def main():
                         break
                 except Exception:
                     pass
-
-            # Or scan DOM for a /viewer/ link
             if not start_url:
                 try:
                     found = await page.evaluate("""
@@ -881,14 +765,13 @@ async def main():
                     chapters = walked
                     print(f"[ok] walked {len(chapters)} chapters via Next")
 
-        # De-dup and optionally cap
+        # de-dup and cap again (safety)
         dedup: Dict[str, Chapter] = {}
         for c in chapters:
             if c.url not in dedup and ("/viewer/" in c.url):
                 dedup[c.url] = c
         chapters = list(dedup.values())
         chapters.sort(key=lambda c: c.idx)
-
         if args.max_chapters and args.max_chapters > 0:
             chapters = chapters[:args.max_chapters]
 
@@ -905,17 +788,6 @@ async def main():
             try:
                 print(f"[open] {ch.idx:03d} {ch.title} -> {ch.url}")
                 await safe_goto(page, ch.url)
-                
-                # quick gate buttons if present
-                for label in START_BUTTON_LABELS:
-                    try:
-                        btn = page.get_by_text(re.compile(label, re.I)).first
-                        if await btn.is_visible(timeout=1000):
-                            await btn.click(timeout=2000)
-                            await page.wait_for_timeout(1200)
-                            break
-                    except Exception:
-                        pass
 
                 html = await page.content()
                 data = extract_readable(html, list_title=ch.title, novel_title=novel.title)
@@ -926,7 +798,7 @@ async def main():
                 print(f"[skip] {ch.idx:03d} {ch.title}: {e}")
                 await page.wait_for_timeout(THROTTLE_MS)
 
-        # Save metadata + chapter list regardless
+        # Persist metadata & chapter list
         (book_dir / "metadata.json").write_text(json.dumps(asdict(novel), ensure_ascii=False, indent=2), "utf-8")
         with (book_dir / "chapters.jsonl").open("w", encoding="utf-8") as f:
             for ch in chapters:
@@ -937,7 +809,6 @@ async def main():
 
         await context.close()
         await browser.close()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
