@@ -494,11 +494,11 @@ class EpubBuilder:
         for i, ep in enumerate(episodes, 1):
             epi_no = int(ep["episode_no"])
             epi_title = ep.get("epi_title") or f"Episode {ep.get('epi_num')}"
-            print(f"[info] ticket for episode {epi_title} …")
+            print(f"[info] ticket for episode {i}; {epi_title} …")
             try:
                 tdata = client.episode_ticket(epi_no)
             except requests.HTTPError as e:
-                print(f"[warn] episode_ticket {epi_title} failed after retries: {e} — skipping")
+                print(f"[warn] episode_ticket {i}; {epi_title} failed after retries: {e} — skipping")
                 if self.debug_dump:
                     with open(os.path.join(self.out_dir, f"ticket_{epi_no}.json"), "w", encoding="utf-8") as f:
                         f.write(getattr(e, "response", None) and getattr(e.response, "text", "") or "")
@@ -506,7 +506,7 @@ class EpubBuilder:
 
             token_t, direct_url = extract_t_token(tdata)
             if not token_t and not direct_url:
-                print(f"[warn] no _t token for episode {epi_no} (title: {epi_title}) — skipping")
+                print(f"[warn] no _t token for episode {i}; {epi_title} (eps_no: {epi_no}) — skipping")
                 if self.debug_dump:
                     with open(os.path.join(self.out_dir, f"ticket_{epi_no}.json"), "w", encoding="utf-8") as f:
                         json.dump(tdata, f, ensure_ascii=False, indent=2)
@@ -521,7 +521,7 @@ class EpubBuilder:
                     r.raise_for_status()
                     cdata = r.json()
             except requests.HTTPError as e:
-                print(f"[warn] content fetch failed for {epi_no}: {e}")
+                print(f"[warn] content fetch failed for episode {i}; {epi_title} (eps_no: {epi_no}: {e}")
                 if self.debug_dump:
                     with open(os.path.join(self.out_dir, f"content_{epi_no}.json"), "w", encoding="utf-8") as f:
                         f.write(getattr(e, "response", None) and getattr(e.response, "text", "") or "")
