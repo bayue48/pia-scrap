@@ -651,6 +651,56 @@ def fetch_and_build(client: NovelpiaClient, novel_id: int, out_dir: str,
         language=language,
         novel_id=novel_id,
     )
+    
+    # Persist metadata and chapter list alongside the EPUB
+    try:
+        nv = data_novel.get("result", {}).get("novel", {})
+        writers = data_novel.get("result", {}).get("writer_list") or []
+        author = writers[0].get("writer_name") if writers and writers[0].get("writer_name") else "Unknown"
+        # tags can be in result.tag_list or novel.tag_list, accept str or dict with name fields
+        tag_items = (data_novel.get("result", {}).get("tag_list")
+                     or nv.get("tag_list")
+                     or [])
+        tags: List[str] = []
+        for t in tag_items:
+            if isinstance(t, str):
+                tags.append(t)
+            elif isinstance(t, dict):
+                val = t.get("tag_name") or t.get("name") or t.get("title")
+                if isinstance(val, str):
+                    tags.append(val)
+        # unique while preserving order
+        seen = set()
+        uniq_tags = []
+        for t in tags:
+            if t not in seen:
+                seen.add(t)
+                uniq_tags.append(t)
+
+        status = "Completed" if str(nv.get("flag_complete", 0)) == "1" else "Ongoing"
+        meta = {
+            "url": f"https://global.novelpia.com/novel/{novel_id}",
+            "title": nv.get("novel_name") or title,
+            "author": author,
+            "tags": uniq_tags,
+            "chapter": len(ep_list) if (max_chapters and max_chapters > 0) else (int(epi_cnt) if epi_cnt else len(ep_list)),
+            "status": status,
+            "description": nv.get("novel_story") or "",
+        }
+        meta_path = os.path.join(out_dir, "metadata.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        chapters_path = os.path.join(out_dir, "chapters.jsonl")
+        with open(chapters_path, "w", encoding="utf-8") as f:
+            for idx, ep in enumerate(ep_list, 1):
+                epi_no = int(ep.get("episode_no"))
+                epi_title = ep.get("epi_title") or f"Episode {ep.get('epi_num')}"
+                rec = {"idx": idx, "title": epi_title, "url": f"https://global.novelpia.com/viewer/{epi_no}"}
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        # Non-fatal; EPUB has already been written
+        pass
     return out_file, title, len(ep_list)
 
 # ----------------------------
@@ -660,8 +710,8 @@ def fetch_and_build(client: NovelpiaClient, novel_id: int, out_dir: str,
 def main():
     ap = argparse.ArgumentParser(description="Novelpia → EPUB packer (API)")
     ap.add_argument("novel_id", type=int, help="novel_no (e.g., 1072)")
-    ap.add_argument("--email", help="Novelpia email (optional if config has tokens)")
-    ap.add_argument("--password", help="Novelpia password (optional if config has tokens)")
+    ap.add_argument("--user", "--email", "-u", "-e", dest="email", help="Novelpia email (overrides config tokens if provided)")
+    ap.add_argument("--pass", "--password", "-p", dest="password", help="Novelpia password (overrides config tokens if provided)")
     ap.add_argument("--out", default="output", help="Output directory")
     ap.add_argument("--max-chapters", "-max", type=int, default=0, help="Fetch up to N chapters (0 = all)")
     ap.add_argument("--lang", default="en", help="EPUB language code (default: en)")
@@ -694,18 +744,12 @@ def main():
     cfg_login_at = (cfg.get("login_at") or "").strip() or None
     cfg_userkey = (cfg.get("userkey") or "").strip() or None
 
-    # Prefer tokens from config if present
-    if cfg_login_at and cfg_userkey:
-        client = NovelpiaClient(email=None, password=None, proxy=args.proxy, throttle=args.throttle, userkey=cfg_userkey)
-        client.tokens.login_at = cfg_login_at
-    else:
-        # Need credentials for first run
-        if not args.email or not args.password:
-            print("[error] No stored tokens found. Please run once with --email and --password to login.")
-            sys.exit(2)
-        client = NovelpiaClient(email=args.email, password=args.password, proxy=args.proxy, throttle=args.throttle, userkey=cfg_userkey)
+    # Priority: CLI credentials > stored tokens > error
+    if args.email and args.password:
+        client = NovelpiaClient(email=args.email, password=args.password, proxy=args.proxy,
+                                throttle=args.throttle, userkey=cfg_userkey)
         client.login()
-        # Persist tokens for next run
+        # Persist/refresh tokens after successful login
         userkey_val = None
         try:
             for c in client.s.cookies:
@@ -715,6 +759,13 @@ def main():
         except Exception:
             pass
         save_config({"login_at": client.tokens.login_at, "userkey": userkey_val or cfg_userkey or ""})
+    elif cfg_login_at and cfg_userkey:
+        client = NovelpiaClient(email=None, password=None, proxy=args.proxy,
+                                throttle=args.throttle, userkey=cfg_userkey)
+        client.tokens.login_at = cfg_login_at
+    else:
+        print("[error] No credentials or stored tokens found. Provide --user and --pass to login once.")
+        sys.exit(2)
 
     try:
         out_file, title, count = fetch_and_build(
