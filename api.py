@@ -4,6 +4,7 @@ import uuid
 import base64
 import html
 import json
+import json as json_mod
 import os
 import re
 import sys
@@ -25,6 +26,25 @@ API_BASE = "https://api-global.novelpia.com"
 IMG_BASE_HTTPS = "https:"
 HTTP_LOG = False 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), ".api.json")
+
+def _extract_errmsg_from_response(resp: Optional[requests.Response]) -> str:
+    try:
+        if resp is None:
+            return ""
+        try:
+            data = resp.json()
+            if isinstance(data, dict):
+                em = data.get("errmsg") or (
+                    isinstance(data.get("result"), dict) and data["result"].get("message")
+                ) or None
+                if isinstance(em, str) and em.strip():
+                    return em.strip()
+        except Exception:
+            pass
+        txt = getattr(resp, "text", "") or ""
+        return txt.strip()
+    except Exception:
+        return ""
 
 SESSION_HEADERS = {
     "accept": "application/json, text/plain, */*",
@@ -127,7 +147,8 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
                           timeout=30, max_retries=3, backoff=1.25,
                           allow_refresh=False, refresh_fn=None):
     """Generic request wrapper: retries on 5xx and network issues.
-    If allow_refresh and body says token expired, call refresh_fn() once and retry.
+    If allow_refresh is True and the response indicates an expired token, invoke
+    refresh_fn() once and then retry the original request exactly once.
     """
     def _mask_value(v: Any) -> Any:
         try:
@@ -154,7 +175,10 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
         out = {}
         for k, v in d.items():
             kl = str(k).lower()
-            if any(x in kl for x in ("pass", "passwd", "password", "authorization", "token", "login-at", "login_at", "_t")):
+            if any(x in kl for x in (
+                "pass", "passwd", "password", "authorization", "token",
+                "login-at", "login_at", "_t", "cookie", "set-cookie"
+            )):
                 out[k] = "***"
             else:
                 out[k] = _mask_value(v)
@@ -162,19 +186,57 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
 
     def _j(x: Any) -> str:
         try:
-            return json.dumps(x, ensure_ascii=False)
+            return json_mod.dumps(x, ensure_ascii=False)
         except Exception:
             return str(x)
 
     attempt = 0
     last_exc = None
+    did_refresh = False
     while attempt < max_retries:
         attempt += 1
         try:
+            # Inject Cookie header (except for login endpoint) using session cookies
+            try:
+                if "/v1/member/login" not in url:
+                    ck = getattr(session, "cookies", None)
+                    if ck is not None:
+                        uval = None
+                        tval = None
+                        try:
+                            for c in ck:
+                                if c.name == "USERKEY":
+                                    uval = c.value
+                                elif c.name == "TKEY":
+                                    tval = c.value
+                        except Exception:
+                            pass
+                        cookie_parts = []
+                        if uval:
+                            cookie_parts.append(f"USERKEY={uval}")
+                        if tval:
+                            cookie_parts.append(f"TKEY={tval}")
+                        cookie_parts.append("last_login=basic")
+                        if cookie_parts:
+                            headers = dict(headers or {})
+                            headers.setdefault("Cookie", "; ".join(cookie_parts))
+            except Exception:
+                pass
+
             if HTTP_LOG:
                 print(f"[api] -> {method} {url} (attempt {attempt}/{max_retries})")
-                if headers:
-                    print(f"[api]    headers: {_j(_mask_kv(headers))}")
+                # Effective headers (session defaults + per-call overrides)
+                try:
+                    eff_headers = {}
+                    try:
+                        eff_headers.update(getattr(session, "headers", {}) or {})
+                    except Exception:
+                        pass
+                    if headers:
+                        eff_headers.update(headers)
+                    print(f"[api]    req-headers: {_j(_mask_kv(eff_headers))}")
+                except Exception:
+                    print("[api]    req-headers: <unavailable>")
                 if params:
                     print(f"[api]    params:  {_j(_mask_kv(params))}")
                 if json is not None:
@@ -191,13 +253,79 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
                     print(f"[api]    data:    {d if isinstance(d, str) else str(d)}")
 
             r = session.request(method, url, headers=headers, params=params, json=json, data=data, timeout=timeout)
-            if allow_refresh:
+            # Handle auth refresh-and-retry for all endpoints except login/refresh
+            if allow_refresh and refresh_fn and not did_refresh:
                 try:
-                    body = r.json()
-                    if body.get("errmsg") == "The token has expired." and refresh_fn:
-                        refresh_fn()
-                        r = session.request(method, url, headers=headers, params=params, json=json, data=data, timeout=timeout)
+                    trigger_refresh = False
+                    # Status-based hint
+                    if getattr(r, "status_code", None) in (401, 403):
+                        trigger_refresh = True
+                    else:
+                        # Body-message based hint (robust to minor variations)
+                        msg = None
+                        try:
+                            body = r.json()
+                            if isinstance(body, dict):
+                                msg = body.get("errmsg") or body.get("message")
+                        except Exception:
+                            try:
+                                msg = r.text
+                            except Exception:
+                                msg = None
+                        if isinstance(msg, str):
+                            s = msg.lower()
+                            if ("token" in s and "expire" in s) or ("the token has expired" in s):
+                                trigger_refresh = True
+                    if trigger_refresh:
+                        try:
+                            # Perform refresh; allow refresh_fn to return the new token
+                            new_login_at = None
+                            try:
+                                new_login_at = refresh_fn()
+                            except TypeError:
+                                # Backward compatibility if refresh_fn returns nothing
+                                refresh_fn()
+                                new_login_at = None
+                            did_refresh = True
+                            # If we got a new token, update headers for retry
+                            if new_login_at:
+                                if headers is None:
+                                    headers = {"login-at": new_login_at}
+                                else:
+                                    headers = dict(headers)
+                                    headers["login-at"] = new_login_at
+                            # Re-inject Cookie header from updated session cookies before retry
+                            try:
+                                ck = getattr(session, "cookies", None)
+                                if ck is not None:
+                                    uval = None
+                                    tval = None
+                                    try:
+                                        for c in ck:
+                                            if c.name == "USERKEY":
+                                                uval = c.value
+                                            elif c.name == "TKEY":
+                                                tval = c.value
+                                    except Exception:
+                                        pass
+                                    cookie_parts = []
+                                    if uval:
+                                        cookie_parts.append(f"USERKEY={uval}")
+                                    if tval:
+                                        cookie_parts.append(f"TKEY={tval}")
+                                    cookie_parts.append("last_login=basic")
+                                    if cookie_parts:
+                                        headers = dict(headers or {})
+                                        headers.setdefault("Cookie", "; ".join(cookie_parts))
+                            except Exception:
+                                pass
+                            # Retry original request once after successful refresh (with possibly updated headers)
+                            r = session.request(method, url, headers=headers, params=params, json=json, data=data, timeout=timeout)
+                        except Exception:
+                            # If refresh fails, fall through and return original response
+                            pass
                 except Exception:
+                    # Be tolerant to any parsing/logging errors
                     pass
             if HTTP_LOG:
                 body_preview = None
@@ -207,6 +335,10 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
                 except Exception:
                     body_preview = "<non-text body>"
                 print(f"[api] <- {r.status_code} {r.reason} from {r.url}")
+                try:
+                    print(f"[api]    resp-headers: {_j(_mask_kv(dict(r.headers))) }")
+                except Exception:
+                    print("[api]    resp-headers: <unavailable>")
                 if body_preview is not None:
                     print(f"[api]    body: {body_preview}")
             if r.status_code >= 500 and attempt < max_retries:
@@ -232,11 +364,13 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
 @dataclass
 class Tokens:
     login_at: Optional[str] = None
+    tkey: Optional[str] = None
+    userkey: Optional[str] = None
 
 class NovelpiaClient:
     def __init__(self, email: Optional[str] = None, password: Optional[str] = None,
                  proxy: Optional[str] = None, timeout: int = 30, throttle: float = 2.0,
-                 userkey: Optional[str] = None):
+                 userkey: Optional[str] = None, tkey: Optional[str] = None):
         self.s = requests.Session()
         self.s.headers.update(SESSION_HEADERS.copy())
         if proxy:
@@ -251,6 +385,10 @@ class NovelpiaClient:
             if not userkey:
                 userkey = uuid.uuid4().hex
             self.s.cookies.set("USERKEY", userkey, domain=".novelpia.com", path="/")
+            self.tokens.userkey = userkey
+            if tkey:
+                self.s.cookies.set("TKEY", tkey, domain=".novelpia.com", path="/")
+                self.tokens.tkey = tkey
         except Exception:
             pass
 
@@ -264,8 +402,17 @@ class NovelpiaClient:
         r.raise_for_status()
         data = r.json()
         self.tokens.login_at = data["result"]["LOGINAT"]
+        # Capture cookies after successful login
+        try:
+            for c in self.s.cookies:
+                if c.name == "TKEY":
+                    self.tokens.tkey = c.value
+                elif c.name == "USERKEY":
+                    self.tokens.userkey = c.value
+        except Exception:
+            pass
 
-    def refresh(self):
+    def refresh(self) -> Optional[str]:
         url = f"{API_BASE}/v1/login/refresh"
         r = request_with_retries(
             self.s, "GET", url,
@@ -274,6 +421,22 @@ class NovelpiaClient:
         )
         r.raise_for_status()
         self.tokens.login_at = r.json()["result"]["LOGINAT"]
+        # Persist refreshed token to config
+        try:
+            cfg: Dict[str, Any] = {}
+            if os.path.exists(CONFIG_PATH):
+                try:
+                    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                        cfg = json.load(f) or {}
+                except Exception:
+                    cfg = {}
+            cfg["login_at"] = self.tokens.login_at
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+                pass
+        except Exception:
+            pass
+        return self.tokens.login_at
 
     def me(self) -> Dict:
         url = f"{API_BASE}/v1/login/me"
@@ -331,6 +494,7 @@ class NovelpiaClient:
             self.s, "GET", url,
             params={"_t": token_t},
             timeout=self.timeout, max_retries=3,
+            allow_refresh=True, refresh_fn=self.refresh,
         )
         r.raise_for_status()
         return r.json()
@@ -498,11 +662,41 @@ class EpubBuilder:
             try:
                 tdata = client.episode_ticket(epi_no)
             except requests.HTTPError as e:
-                print(f"[warn] episode_ticket {i}; {epi_title} failed after retries: {e} — skipping")
-                if self.debug_dump:
-                    with open(os.path.join(self.out_dir, f"ticket_{epi_no}.json"), "w", encoding="utf-8") as f:
-                        f.write(getattr(e, "response", None) and getattr(e.response, "text", "") or "")
-                continue
+                # If token expired, refresh and retry once
+                should_retry = False
+                try:
+                    resp = getattr(e, "response", None)
+                    msg = None
+                    if resp is not None:
+                        try:
+                            body = resp.json()
+                            msg = isinstance(body, dict) and body.get("errmsg")
+                        except Exception:
+                            msg = resp.text if hasattr(resp, "text") else None
+                    if isinstance(msg, str) and "The token has expired." in msg:
+                        try:
+                            client.refresh()
+                            should_retry = True
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                if should_retry:
+                    try:
+                        tdata = client.episode_ticket(epi_no)
+                        print(f"[info] retry ticket for episode {i}; {epi_title} …")
+                    except requests.HTTPError as e2:
+                        print(f"[warn] episode_ticket {i}; {epi_title} failed after refresh: {e2} — skipping")
+                        if self.debug_dump:
+                            with open(os.path.join(self.out_dir, f"ticket_{epi_no}.json"), "w", encoding="utf-8") as f:
+                                f.write(getattr(e2, "response", None) and getattr(e2.response, "text", "") or "")
+                        continue
+                else:
+                    print(f"[warn] episode_ticket {i}; {epi_title} failed after retries: {e} — skipping")
+                    if self.debug_dump:
+                        with open(os.path.join(self.out_dir, f"ticket_{epi_no}.json"), "w", encoding="utf-8") as f:
+                            f.write(getattr(e, "response", None) and getattr(e.response, "text", "") or "")
+                    continue
 
             token_t, direct_url = extract_t_token(tdata)
             if not token_t and not direct_url:
@@ -521,11 +715,46 @@ class EpubBuilder:
                     r.raise_for_status()
                     cdata = r.json()
             except requests.HTTPError as e:
-                print(f"[warn] content fetch failed for episode {i}; {epi_title} (eps_no: {epi_no}: {e}")
-                if self.debug_dump:
-                    with open(os.path.join(self.out_dir, f"content_{epi_no}.json"), "w", encoding="utf-8") as f:
-                        f.write(getattr(e, "response", None) and getattr(e.response, "text", "") or "")
-                continue
+                # If token expired, refresh and retry once; else skip
+                should_retry = False
+                try:
+                    resp = getattr(e, "response", None)
+                    msg = None
+                    if resp is not None:
+                        try:
+                            body = resp.json()
+                            msg = isinstance(body, dict) and body.get("errmsg")
+                        except Exception:
+                            msg = resp.text if hasattr(resp, "text") else None
+                    if isinstance(msg, str) and "The token has expired." in msg:
+                        try:
+                            client.refresh()
+                            should_retry = True
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                if should_retry:
+                    try:
+                        if token_t:
+                            cdata = client.episode_content(token_t)
+                            print(f"[info] retry ticket for episode {i}; {epi_title} …")
+                        else:
+                            r = client.s.get(direct_url, timeout=client.timeout)
+                            r.raise_for_status()
+                            cdata = r.json()
+                    except requests.HTTPError as e2:
+                        print(f"[warn] content fetch failed after refresh for episode {i}; {epi_title} (eps_no: {epi_no}): {e2}")
+                        if self.debug_dump:
+                            with open(os.path.join(self.out_dir, f"content_{epi_no}.json"), "w", encoding="utf-8") as f:
+                                f.write(getattr(e2, "response", None) and getattr(e2.response, "text", "") or "")
+                        continue
+                else:
+                    print(f"[warn] content fetch failed for episode {i}; {epi_title} (eps_no: {epi_no}: {e}")
+                    if self.debug_dump:
+                        with open(os.path.join(self.out_dir, f"content_{epi_no}.json"), "w", encoding="utf-8") as f:
+                            f.write(getattr(e, "response", None) and getattr(e.response, "text", "") or "")
+                    continue
 
             # Prefer result.data.epi_content* fields and concatenate
             result_block = (cdata.get("result", {}) or {})
@@ -613,7 +842,10 @@ class EpubBuilder:
             s = _re.sub(r"[^a-z0-9]+", "-", s).strip("-")
             return s or "book"
         base = _kebab(filename_hint or title)
-        out_path = os.path.join(self.out_dir, f"{base}.epub")
+        # Ensure per-book output folder next to EPUB
+        book_dir = os.path.join(self.out_dir, base)
+        ensure_dir(book_dir)
+        out_path = os.path.join(book_dir, f"{base}.epub")
         epub.write_epub(out_path, book, {})
         return out_path
 
@@ -625,13 +857,29 @@ def fetch_and_build(client: NovelpiaClient, novel_id: int, out_dir: str,
                     max_chapters: Optional[int], language: str,
                     debug_dump: bool = False):
     # Confirm token
-    _ = client.me()
-
+    _res = client.me()
+    try:
+        status_ok = str((_res or {}).get("statusCode")) == "200"
+        code_ok = str((_res or {}).get("code") or "0000") in ("0000", "0")
+        if status_ok and code_ok:
+            mem_nick = (((_res.get("result") or {}).get("login") or {}).get("mem_nick")) or "Unknown"
+            print(f"[auth] Logged in as: {mem_nick}")
+        else:
+            em = (_res or {}).get("errmsg") or "Unknown authentication error"
+            print(f"[auth] Error: {em}")
+    except Exception:
+        pass
+    
     # Novel data
+    print("[info] extracting metadata…")
     data_novel = client.novel(novel_id)
     nv = data_novel["result"]["novel"]
     title = nv.get("novel_name", f"novel_{novel_id}")
     epi_cnt = data_novel["result"].get("info", {}).get("epi_cnt") or nv.get("count_epi") or 0
+    writers = data_novel.get("result", {}).get("writer_list") or []
+    author = writers[0].get("writer_name") if writers and writers[0].get("writer_name") else "Unknown"
+    status = "Completed" if str(nv.get("flag_complete", 0)) == "1" else "Ongoing"
+    print(f"[info] title={title!r} author={author!r} chapter={epi_cnt!r} status={status!r}")
 
     # Episode list
     rows = int(epi_cnt) if epi_cnt else 1000
@@ -654,9 +902,9 @@ def fetch_and_build(client: NovelpiaClient, novel_id: int, out_dir: str,
     
     # Persist metadata and chapter list alongside the EPUB
     try:
+        # Write metadata next to the generated EPUB file
+        book_dir = os.path.dirname(out_file)
         nv = data_novel.get("result", {}).get("novel", {})
-        writers = data_novel.get("result", {}).get("writer_list") or []
-        author = writers[0].get("writer_name") if writers and writers[0].get("writer_name") else "Unknown"
         # tags can be in result.tag_list or novel.tag_list, accept str or dict with name fields
         tag_items = (data_novel.get("result", {}).get("tag_list")
                      or nv.get("tag_list")
@@ -677,7 +925,6 @@ def fetch_and_build(client: NovelpiaClient, novel_id: int, out_dir: str,
                 seen.add(t)
                 uniq_tags.append(t)
 
-        status = "Completed" if str(nv.get("flag_complete", 0)) == "1" else "Ongoing"
         meta = {
             "url": f"https://global.novelpia.com/novel/{novel_id}",
             "title": nv.get("novel_name") or title,
@@ -687,11 +934,11 @@ def fetch_and_build(client: NovelpiaClient, novel_id: int, out_dir: str,
             "status": status,
             "description": nv.get("novel_story") or "",
         }
-        meta_path = os.path.join(out_dir, "metadata.json")
+        meta_path = os.path.join(book_dir, "metadata.json")
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
-        chapters_path = os.path.join(out_dir, "chapters.jsonl")
+        chapters_path = os.path.join(book_dir, "chapters.jsonl")
         with open(chapters_path, "w", encoding="utf-8") as f:
             for idx, ep in enumerate(ep_list, 1):
                 epi_no = int(ep.get("episode_no"))
@@ -743,25 +990,32 @@ def main():
     cfg = load_config()
     cfg_login_at = (cfg.get("login_at") or "").strip() or None
     cfg_userkey = (cfg.get("userkey") or "").strip() or None
+    cfg_tkey = (cfg.get("tkey") or "").strip() or None
 
     # Priority: CLI credentials > stored tokens > error
     if args.email and args.password:
         client = NovelpiaClient(email=args.email, password=args.password, proxy=args.proxy,
-                                throttle=args.throttle, userkey=cfg_userkey)
+                                throttle=args.throttle, userkey=cfg_userkey, tkey=cfg_tkey)
         client.login()
         # Persist/refresh tokens after successful login
         userkey_val = None
+        tkey_val = None
         try:
             for c in client.s.cookies:
                 if c.name == "USERKEY":
                     userkey_val = c.value
-                    break
+                elif c.name == "TKEY":
+                    tkey_val = c.value
         except Exception:
             pass
-        save_config({"login_at": client.tokens.login_at, "userkey": userkey_val or cfg_userkey or ""})
+        save_config({
+            "login_at": client.tokens.login_at,
+            "userkey": userkey_val or cfg_userkey or "",
+            "tkey": tkey_val or client.tokens.tkey or cfg_tkey or "",
+        })
     elif cfg_login_at and cfg_userkey:
         client = NovelpiaClient(email=None, password=None, proxy=args.proxy,
-                                throttle=args.throttle, userkey=cfg_userkey)
+                                throttle=args.throttle, userkey=cfg_userkey, tkey=cfg_tkey)
         client.tokens.login_at = cfg_login_at
     else:
         print("[error] No credentials or stored tokens found. Provide --user and --pass to login once.")
@@ -774,7 +1028,10 @@ def main():
             language=args.lang, debug_dump=args.debug
         )
     except requests.HTTPError as e:
-        print(f"[error] HTTP error: {e} | body: {getattr(e, 'response', None) and getattr(e.response, 'text', '')}")
+        resp = getattr(e, 'response', None)
+        em = _extract_errmsg_from_response(resp)
+        em_part = f" | errmsg: {em}" if em else ""
+        print(f"[error] HTTP error: {e}{em_part}")
         sys.exit(1)
 
     print(f"[success] Wrote EPUB: {out_file}  |  Title: {title}  |  Chapters: {count}")
