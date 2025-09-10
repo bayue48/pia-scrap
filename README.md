@@ -93,7 +93,7 @@ output/<title>/chapters.jsonl
 
 ---
 
-## ✅ Example Session
+## Example Session
 
 ```
 [auth] Logged in as: FoggyRam2237
@@ -116,6 +116,6 @@ output/<title>/chapters.jsonl
 
 ---
 
-## 📄 License
+## License
 
 Provided “as is”, for personal use only. Do not redistribute the content. Follow Novelpia’s Terms of Service and Copyright.
