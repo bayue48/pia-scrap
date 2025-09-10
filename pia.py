@@ -1,814 +1,1044 @@
 import argparse
-import asyncio
+import random
+import uuid
+import base64
+import html
 import json
+import json as json_mod
+import os
 import re
-import httpx
-import math
-from dataclasses import dataclass, asdict
-from html import escape as hesc
-from pathlib import Path
-from typing import Optional, List, Dict, Any, Set
-from bs4 import BeautifulSoup
-from slugify import slugify
-from playwright.async_api import async_playwright, Browser, Page, TimeoutError as PWTimeout
+import sys
+import time
+import requests
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Any
+from urllib.parse import urljoin, urlparse, parse_qs
+from requests.exceptions import RequestException
 from ebooklib import epub
+from bs4 import BeautifulSoup
 
-# --------- Config ---------
-BASE = "https://global.novelpia.com"
-ROBOTS_URL = f"{BASE}/robots.txt"
-DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 Edg/91.0.864.59"
-NAV_TIMEOUT = 25_000
-SCROLL_PAUSE_MS = 300
-MAX_SCROLLS_PAGE = 50
-LIST_SCROLL_PAUSE_MS = 280
-THROTTLE_MS = 700
-CONSENT_BUTTON_LABELS = [r"^I agree$", r"^Agree$", r"^Accept$", r"^Ok$", r"^Close$"]
-NEXT_BUTTON_LABELS = [r"^Next$", r"^Next Episode$", r"^Next Chapter$", r"^다음$", r"^다음 화$", r"^▶$", r"^›$"]
-START_BUTTON_LABELS = [r"^Start reading$", r"^Read$", r"^Start$", r"^Continue$"]
+# ----------------------------
+# Constants & Helpers
+# ----------------------------
 
-# --------- Data ---------
-@dataclass
-class Chapter:
-    idx: int
-    title: str
-    url: str
+BASE_URL = "https://global.novelpia.com"
+API_BASE = "https://api-global.novelpia.com"
+IMG_BASE_HTTPS = "https:"
+HTTP_LOG = False 
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), ".api.json")
 
-@dataclass
-class NovelMeta:
-    url: str
-    title: str
-    author: Optional[str]
-    tags: List[str]
-    description: Optional[str]
-    status: Optional[str] = None
-
-# --------- Helpers ---------
-async def handle_consent_buttons(page: Page) -> None:
-    for label in CONSENT_BUTTON_LABELS:
+def _extract_errmsg_from_response(resp: Optional[requests.Response]) -> str:
+    try:
+        if resp is None:
+            return ""
         try:
-            btn = page.get_by_role("button", name=re.compile(label, re.I)).first
-            if await btn.is_visible(timeout=1000):
-                await btn.click(timeout=1500)
-                await page.wait_for_timeout(300)
-                break
-        except Exception:
-            continue
-
-async def safe_goto(page: Page, url: str, wait_for_network_idle: bool = True) -> None:
-    await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-    if wait_for_network_idle:
-        try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
-        except PWTimeout:
-            pass
-    await handle_consent_buttons(page)
-
-async def get_total_chapters(page: Page) -> Optional[int]:
-    try:
-        val = await page.evaluate("""
-        () => {
-          const el = document.querySelector('.ch-list-header .header-tit .text-primary-text');
-          if(!el) return null;
-          const n = parseInt((el.textContent||'').replace(/[^0-9]/g,''), 10);
-          return Number.isFinite(n) ? n : null;
-        }
-        """)
-        return int(val) if val else None
-    except Exception:
-        return None
-
-async def get_current_page_num(page: Page) -> Optional[int]:
-    try:
-        txt = await page.locator('.pagination .page-btn.current').first.text_content()
-        return int((txt or '').strip())
-    except Exception:
-        return None
-
-async def goto_page(page: Page, target: int) -> bool:
-    """Navigate to a specific numeric page in the chapter list."""
-    def js_has_target(n: int) -> str:
-        return f"""
-        () => !!Array.from(document.querySelectorAll('.pagination .page-btn:not(.arrow)'))
-               .find(el => (el.textContent||'').trim() === '{n}')
-        """
-
-    try:
-        cur_txt = await page.locator('.pagination .page-btn.current').first.text_content()
-        if cur_txt and cur_txt.strip().isdigit() and int(cur_txt.strip()) == target:
-            return True
-    except Exception:
-        pass
-
-    try:
-        btn = page.locator(f'.pagination .page-btn:not(.arrow):has-text("{target}")').first
-        if await btn.count():
-            await btn.click(timeout=1800)
-            await page.wait_for_function(
-                f"() => (document.querySelector('.pagination .page-btn.current')?.textContent||'').trim() === '{target}'",
-                timeout=6000
-            )
-            return True
-    except Exception:
-        pass
-
-    # step groups via ›
-    for _ in range(40):
-        try:
-            if await page.evaluate(js_has_target(target)):
-                btn = page.locator(f'.pagination .page-btn:not(.arrow):has-text("{target}")').first
-                await btn.click(timeout=1800)
-                await page.wait_for_function(
-                    f"() => (document.querySelector('.pagination .page-btn.current')?.textContent||'').trim() === '{target}'",
-                    timeout=6000
-                )
-                return True
-
-            nxt = page.locator('.pagination .page-btn.arrow:has-text("›")').first
-            if not await nxt.count():
-                break
-            await nxt.click(timeout=1500)
-            await page.wait_for_timeout(300)
+            data = resp.json()
+            if isinstance(data, dict):
+                em = data.get("errmsg") or (
+                    isinstance(data.get("result"), dict) and data["result"].get("message")
+                ) or None
+                if isinstance(em, str) and em.strip():
+                    return em.strip()
         except Exception:
             pass
-    return False
-
-def parse_netscape_cookies(txt_path: Path) -> List[Dict]:
-    cookies: List[Dict[str, Any]] = []
-    for raw in txt_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split("\t")
-        if len(parts) != 7:
-            parts = re.split(r"\s+", line)
-        if len(parts) < 7:
-            continue
-        domain, include_sub, path, secure, expiry, name, value = parts[:7]
-        c: Dict[str, Any] = {
-            "name": name, "value": value, "domain": domain, "path": path or "/",
-            "secure": secure.upper() == "TRUE", "httpOnly": False, "sameSite": "Lax",
-        }
-        try:
-            exp = int(expiry)
-            if exp > 0:
-                c["expires"] = exp
-        except Exception:
-            pass
-        cookies.append(c)
-    return cookies
-
-async def ensure_login(context, cookies_json: Optional[str], cookies_txt: Optional[str]):
-    if cookies_json:
-        p = Path(cookies_json)
-        if p.exists():
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and "cookies" in data:
-                    data = data["cookies"]
-                await context.add_cookies(data)
-                print(f"[auth] loaded {len(data)} cookies from JSON")
-            except Exception as e:
-                print(f"[warn] cookies JSON load failed: {e}")
-
-    if cookies_txt:
-        p = Path(cookies_txt)
-        if p.exists():
-            try:
-                data = parse_netscape_cookies(p)
-                await context.add_cookies(data)
-                print(f"[auth] loaded {len(data)} cookies from cookies.txt")
-            except Exception as e:
-                print(f"[warn] cookies.txt load failed: {e}")
-
-async def looks_logged_out(page: Page) -> bool:
-    """Heuristic: if clicking TOC items yields no /viewer/ and a Sign In button is present."""
-    try:
-        # Login routes or obvious sign components
-        if re.search(r"/auth|/login|/signin", page.url, re.I):
-            return True
-        # Top-right "Sign In" button visible on list page
-        btn = page.get_by_text(re.compile(r"^\s*Sign In\s*$", re.I)).first
-        if await btn.count():
-            # treat it as a weak signal; still return True (works well in practice when cookies expire)
-            return True
+        txt = getattr(resp, "text", "") or ""
+        return txt.strip()
     except Exception:
-        pass
-    return False
+        return ""
 
-async def maybe_reauth(page: Page, context, novel_url: str, cookies_json: Optional[str], cookies_txt: Optional[str], where: str) -> None:
-    if await looks_logged_out(page):
-        print(f"[auth] login UI detected ({where}); reauth and reload…")
-        await ensure_login(context, cookies_json, cookies_txt)
-        await safe_goto(page, novel_url)
+SESSION_HEADERS = {
+    "accept": "application/json, text/plain, */*",
+    "accept-language": "en-US,en;q=0.9",
+    "origin": BASE_URL,
+    "referer": f"{BASE_URL}/",
+    "user-agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/138.0.0.0 Safari/537.36"
+    ),
+    "x-requested-with": "XMLHttpRequest",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site",
+    "sec-fetch-dest": "empty",
+    "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
 
-async def fetch_cover_bytes_from_page(page: Page) -> Optional[bytes]:
-    cover_url = None
-    try:
-        cover_url = await page.locator('meta[property="og:image"]').first.get_attribute("content")
-    except Exception:
-        pass
-    if not cover_url:
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def sanitize_filename(name: str) -> str:
+    return re.sub(r'[\\/:*?"<>|]+', "_", (name or "").strip()) or "book"
+
+def normalize_url(u: str) -> str:
+    if not u:
+        return u
+    if u.startswith("//"):
+        return IMG_BASE_HTTPS + u
+    if u.startswith("/"):
+        return urljoin(BASE_URL, u)
+    return u
+
+def media_type_from_ext(ext: str) -> str:
+    ext = ext.lower()
+    if ext in (".jpg", ".jpeg"):
+        return "image/jpeg"
+    if ext == ".png":
+        return "image/png"
+    if ext == ".gif":
+        return "image/gif"
+    if ext == ".webp":
+        return "image/webp"
+    return "image/jpeg"
+
+def looks_like_jwt(token: Optional[str]) -> bool:
+    if not isinstance(token, str):
+        return False
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    for p in parts:
         try:
-            cover_url = await page.locator('meta[name="twitter:image"]').first.get_attribute("content")
+            base64.urlsafe_b64decode(p + "===")
         except Exception:
-            pass
+            return False
+    return True
 
-    def _abs_url(href: Optional[str]) -> Optional[str]:
-        if not href:
-            return None
-        if href.startswith("http://") or href.startswith("https://"):
-            return href
-        if href.startswith("//"):
-            return "https:" + href
-        if href.startswith("/"):
-            return f"{BASE}{href}"
-        return href
+def html_from_episode_text(raw_html: str) -> str:
+    soup = BeautifulSoup(raw_html or "", "html.parser")
 
-    if cover_url:
-        cover_url = _abs_url(cover_url)
+    # normalize images
+    for img in soup.find_all("img"):
+        if img.get("data-src") and not img.get("src"):
+            img["src"] = img["data-src"]
+        if "style" in img.attrs:
+            del img["style"]
+        if img.get("src"):
+            img["src"] = normalize_url(img["src"])
 
-    if not cover_url:
-        try:
-            sel = ".nv-cover img, .cover img, img[alt*='cover' i], img[src*='cover']"
-            src = await page.locator(sel).first.get_attribute("src")
-            cover_url = _abs_url(src)
-        except Exception:
-            pass
+    # Ensure document wrapper
+    if not soup.find("html"):
+        html_tag = soup.new_tag("html")
+        head = soup.new_tag("head")
+        meta = soup.new_tag("meta", charset="utf-8")
+        head.append(meta)
+        body = soup.new_tag("body")
+        for el in list(soup.children):
+            body.append(el.extract())
+        html_tag.append(head)
+        html_tag.append(body)
+        soup.append(html_tag)
 
-    if not cover_url:
-        return None
+    return str(soup)
 
-    try:
-        async with httpx.AsyncClient(timeout=20, headers={"User-Agent": DEFAULT_UA}) as client:
-            r = await client.get(cover_url)
-            r.raise_for_status()
-            return r.content
-    except Exception:
-        return None
+# ----------------------------
+# Resilient request layer
+# ----------------------------
 
-# --------- Metadata ---------
-async def extract_meta(page: Page, novel_url: str) -> NovelMeta:
-    print("[stage] extracting metadata…")
+def merge_login_at(headers: dict, login_at: Optional[str]) -> dict:
+    h = dict(headers or {})
+    if login_at:
+        h["login-at"] = login_at
+    return h
 
-    title = ""
-    try:
-        pt = await page.title()
-        if pt:
-            title = re.sub(r"^\s*Novelpia\s*-\s*", "", pt.strip(), flags=re.I)
-            title = re.sub(r"\s*-\s*Novelpia\s*$", "", title, flags=re.I)
-    except Exception:
-        pass
-    if not title:
-        try:
-            ogt = await page.locator('meta[property="og:title"]').first.get_attribute("content")
-            if ogt:
-                ogt = re.sub(r"^\s*Novelpia\s*-\s*", "", ogt.strip(), flags=re.I)
-                ogt = re.sub(r"\s*-\s*Novelpia\s*$", "", ogt, flags=re.I)
-                title = ogt
-        except Exception:
-            pass
-
-    js = """
-    () => {
-      const q = (s) => document.querySelector(s);
-      const qa = (s) => Array.from(document.querySelectorAll(s));
-      const txt = (el) => (el && (el.textContent||'').trim()) || '';
-      let author = '';
-      const labels = qa('*');
-      for (const el of labels) {
-        if (/^Author$/i.test((el.textContent||'').trim())) {
-          const sib = el.nextElementSibling;
-          author = txt(sib);
-          if (author) break;
-        }
-      }
-      if (!author) {
-        const m = qa('*').map(e => txt(e)).find(t => /^Author\\s*[:\\-]?/i.test(t));
-        if (m) author = m.replace(/^Author\\s*[:\\-]?/i,'').trim();
-      }
-      const tags = qa('a,span').map(e => txt(e)).filter(t => /^#/.test(t)).map(t => t.replace(/^#/, '').trim());
-      let status = txt(q('.nv-stat-badge'));
-      if (/comp|completed/i.test(status)) status = 'Completed';
-      else if (/ongoing|up/i.test(status)) status = 'Ongoing';
-      return {author, tags: Array.from(new Set(tags)), status};
-    }
+def request_with_retries(session: requests.Session, method: str, url: str, *,
+                          headers=None, params=None, json=None, data=None,
+                          timeout=30, max_retries=3, backoff=1.25,
+                          allow_refresh=False, refresh_fn=None):
+    """Generic request wrapper: retries on 5xx and network issues.
+    If allow_refresh is True and the response indicates an expired token, invoke
+    refresh_fn() once and then retry the original request exactly once.
     """
-    try:
-        got = await page.evaluate(js)
-    except Exception:
-        got = {"author": "", "tags": [], "status": None}
-
-    author = (got.get("author") or "").strip() or None
-    tags = got.get("tags") or []
-    status = got.get("status") or None
-
-    description = None
-    try:
-        html = await page.content()
-        soup = BeautifulSoup(html, "html.parser")
-        blocks = soup.select("article, .description, .prose, .detail, .content, p")
-        best = ""
-        for n in blocks[:60]:
-            t = n.get_text(" ", strip=True)
-            if len(t) > len(best): best = t
-        description = best or None
-    except Exception:
-        pass
-
-    meta = NovelMeta(novel_url, title or "Untitled", author, tags, description, status)
-    print(f"[meta] title={meta.title!r} status={meta.status!r} author={meta.author!r}")
-    return meta
-
-# --------- TOC collection ---------
-async def click_item_capture_viewer(page: Page, item_index: int, cur_page: int, novel_url: str) -> Optional[str]:
-    """Click Nth item -> capture /viewer/ URL -> return to TOC page 'cur_page'."""
-    selectors = [
-        f".ch-list-section .list-item:nth-of-type({item_index+1})",
-        f".ch-list-section .list-item:nth-of-type({item_index+1}) .ch-info-wrapper",
-        f".ch-list-section .list-item:nth-of-type({item_index+1}) .ch-info",
-    ]
-    for sel in selectors:
+    def _mask_value(v: Any) -> Any:
         try:
-            el = page.locator(sel).first
-            if not await el.count():
-                continue
-            await el.scroll_into_view_if_needed()
-            before = page.url
-            await el.click(timeout=1800, force=True)
+            if isinstance(v, dict):
+                return {k: _mask_value(v2) for k, v2 in v.items()}
+            if isinstance(v, list):
+                return [_mask_value(x) for x in v]
+            if isinstance(v, str):
+                low = v.lower()
+                # Mask long tokens / JWT-like
+                if low.count(".") == 2 and all(len(p) > 5 for p in v.split(".")):
+                    parts = v.split(".")
+                    return parts[0][:6] + "..." + parts[-1][-6:]
+                if len(v) > 64:
+                    return v[:32] + "…(trunc)"
+                return v
+            return v
+        except Exception:
+            return "<masked>"
 
-            # tiny bounded wait for SPA route
+    def _mask_kv(d: Optional[dict]) -> Optional[dict]:
+        if not isinstance(d, dict):
+            return d
+        out = {}
+        for k, v in d.items():
+            kl = str(k).lower()
+            if any(x in kl for x in (
+                "pass", "passwd", "password", "authorization", "token",
+                "login-at", "login_at", "_t", "cookie", "set-cookie"
+            )):
+                out[k] = "***"
+            else:
+                out[k] = _mask_value(v)
+        return out
+
+    def _j(x: Any) -> str:
+        try:
+            return json_mod.dumps(x, ensure_ascii=False)
+        except Exception:
+            return str(x)
+
+    attempt = 0
+    last_exc = None
+    did_refresh = False
+    while attempt < max_retries:
+        attempt += 1
+        try:
+            # Inject Cookie header (except for login endpoint) using session cookies
             try:
-                await page.wait_for_function("() => location.href.includes('/viewer/')", timeout=2500)
+                if "/v1/member/login" not in url:
+                    ck = getattr(session, "cookies", None)
+                    if ck is not None:
+                        uval = None
+                        tval = None
+                        try:
+                            for c in ck:
+                                if c.name == "USERKEY":
+                                    uval = c.value
+                                elif c.name == "TKEY":
+                                    tval = c.value
+                        except Exception:
+                            pass
+                        cookie_parts = []
+                        if uval:
+                            cookie_parts.append(f"USERKEY={uval}")
+                        if tval:
+                            cookie_parts.append(f"TKEY={tval}")
+                        cookie_parts.append("last_login=basic")
+                        if cookie_parts:
+                            headers = dict(headers or {})
+                            headers.setdefault("Cookie", "; ".join(cookie_parts))
             except Exception:
                 pass
 
-            new_url = page.url
-            if "/viewer/" in new_url and new_url != before:
-                # go straight back to the same TOC page
-                await safe_goto(page, novel_url)
-                await page.wait_for_selector(".ch-list-section", timeout=6000)
-                await goto_page(page, cur_page)
-                return new_url
+            if HTTP_LOG:
+                print(f"[api] -> {method} {url} (attempt {attempt}/{max_retries})")
+                # Effective headers (session defaults + per-call overrides)
+                try:
+                    eff_headers = {}
+                    try:
+                        eff_headers.update(getattr(session, "headers", {}) or {})
+                    except Exception:
+                        pass
+                    if headers:
+                        eff_headers.update(headers)
+                    print(f"[api]    req-headers: {_j(_mask_kv(eff_headers))}")
+                except Exception:
+                    print("[api]    req-headers: <unavailable>")
+                if params:
+                    print(f"[api]    params:  {_j(_mask_kv(params))}")
+                if json is not None:
+                    print(f"[api]    json:    {_j(_mask_kv(json))}")
+                if data is not None and not json:
+                    # data may be bytes/str; keep short
+                    d = data if isinstance(data, (str, bytes)) else _j(_mask_kv(data))
+                    if isinstance(d, bytes):
+                        d = d[:128] + b"..." if len(d) > 128 else d
+                        try:
+                            d = d.decode("utf-8", "ignore")
+                        except Exception:
+                            d = "<bytes>"
+                    print(f"[api]    data:    {d if isinstance(d, str) else str(d)}")
 
-            # if no route, try sniffing nested href quickly
-            try:
-                href = await el.locator("a[href*='/viewer/']").first.get_attribute("href")
-                if href:
-                    url = href if href.startswith("http") else (BASE + href)
-                    await safe_goto(page, novel_url)
-                    await page.wait_for_selector(".ch-list-section", timeout=6000)
-                    await goto_page(page, cur_page)
-                    return url
-            except Exception:
+            r = session.request(method, url, headers=headers, params=params, json=json, data=data, timeout=timeout)
+            # Handle auth refresh-and-retry for all endpoints except login/refresh
+            if allow_refresh and refresh_fn and not did_refresh:
+                try:
+                    trigger_refresh = False
+                    # Status-based hint
+                    if getattr(r, "status_code", None) in (401, 403):
+                        trigger_refresh = True
+                    else:
+                        # Body-message based hint (robust to minor variations)
+                        msg = None
+                        try:
+                            body = r.json()
+                            if isinstance(body, dict):
+                                msg = body.get("errmsg") or body.get("message")
+                        except Exception:
+                            try:
+                                msg = r.text
+                            except Exception:
+                                msg = None
+                        if isinstance(msg, str):
+                            s = msg.lower()
+                            if ("token" in s and "expire" in s) or ("the token has expired" in s):
+                                trigger_refresh = True
+                    if trigger_refresh:
+                        try:
+                            # Perform refresh; allow refresh_fn to return the new token
+                            new_login_at = None
+                            try:
+                                new_login_at = refresh_fn()
+                            except TypeError:
+                                # Backward compatibility if refresh_fn returns nothing
+                                refresh_fn()
+                                new_login_at = None
+                            did_refresh = True
+                            # If we got a new token, update headers for retry
+                            if new_login_at:
+                                if headers is None:
+                                    headers = {"login-at": new_login_at}
+                                else:
+                                    headers = dict(headers)
+                                    headers["login-at"] = new_login_at
+                            # Re-inject Cookie header from updated session cookies before retry
+                            try:
+                                ck = getattr(session, "cookies", None)
+                                if ck is not None:
+                                    uval = None
+                                    tval = None
+                                    try:
+                                        for c in ck:
+                                            if c.name == "USERKEY":
+                                                uval = c.value
+                                            elif c.name == "TKEY":
+                                                tval = c.value
+                                    except Exception:
+                                        pass
+                                    cookie_parts = []
+                                    if uval:
+                                        cookie_parts.append(f"USERKEY={uval}")
+                                    if tval:
+                                        cookie_parts.append(f"TKEY={tval}")
+                                    cookie_parts.append("last_login=basic")
+                                    if cookie_parts:
+                                        headers = dict(headers or {})
+                                        headers.setdefault("Cookie", "; ".join(cookie_parts))
+                            except Exception:
+                                pass
+                            # Retry original request once after successful refresh (with possibly updated headers)
+                            r = session.request(method, url, headers=headers, params=params, json=json, data=data, timeout=timeout)
+                        except Exception:
+                            # If refresh fails, fall through and return original response
+                            pass
+                except Exception:
+                    # Be tolerant to any parsing/logging errors
+                    pass
+            if HTTP_LOG:
+                body_preview = None
+                try:
+                    t = r.text
+                    body_preview = (t[:500] + "…") if len(t) > 500 else t
+                except Exception:
+                    body_preview = "<non-text body>"
+                print(f"[api] <- {r.status_code} {r.reason} from {r.url}")
+                try:
+                    print(f"[api]    resp-headers: {_j(_mask_kv(dict(r.headers))) }")
+                except Exception:
+                    print("[api]    resp-headers: <unavailable>")
+                if body_preview is not None:
+                    print(f"[api]    body: {body_preview}")
+            if r.status_code >= 500 and attempt < max_retries:
+                time.sleep(backoff ** attempt)
+                continue
+            return r
+        except RequestException as e:
+            if HTTP_LOG:
+                print(f"[api] !! {method} {url} failed on attempt {attempt}: {e}")
+            last_exc = e
+            if attempt < max_retries:
+                time.sleep(backoff ** attempt)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    return r
+
+# ----------------------------
+# API Client
+# ----------------------------
+
+@dataclass
+class Tokens:
+    login_at: Optional[str] = None
+    tkey: Optional[str] = None
+    userkey: Optional[str] = None
+
+class NovelpiaClient:
+    def __init__(self, email: Optional[str] = None, password: Optional[str] = None,
+                 proxy: Optional[str] = None, timeout: int = 30, throttle: float = 2.0,
+                 userkey: Optional[str] = None, tkey: Optional[str] = None):
+        self.s = requests.Session()
+        self.s.headers.update(SESSION_HEADERS.copy())
+        if proxy:
+            self.s.proxies.update({"http": proxy, "https": proxy})
+        self.timeout = timeout
+        self.tokens = Tokens()
+        self.email = email
+        self.password = password
+        # delay seconds between episode-related API calls to reduce 429/500 rate limits
+        self.throttle = max(0.0, float(throttle or 0.0))
+        try:
+            if not userkey:
+                userkey = uuid.uuid4().hex
+            self.s.cookies.set("USERKEY", userkey, domain=".novelpia.com", path="/")
+            self.tokens.userkey = userkey
+            if tkey:
+                self.s.cookies.set("TKEY", tkey, domain=".novelpia.com", path="/")
+                self.tokens.tkey = tkey
+        except Exception:
+            pass
+
+    def login(self):
+        url = f"{API_BASE}/v1/member/login"
+        r = request_with_retries(
+            self.s, "POST", url,
+            json={"email": self.email, "passwd": self.password},
+            timeout=self.timeout, max_retries=2,
+        )
+        r.raise_for_status()
+        data = r.json()
+        self.tokens.login_at = data["result"]["LOGINAT"]
+        # Capture cookies after successful login
+        try:
+            for c in self.s.cookies:
+                if c.name == "TKEY":
+                    self.tokens.tkey = c.value
+                elif c.name == "USERKEY":
+                    self.tokens.userkey = c.value
+        except Exception:
+            pass
+
+    def refresh(self) -> Optional[str]:
+        url = f"{API_BASE}/v1/login/refresh"
+        r = request_with_retries(
+            self.s, "GET", url,
+            headers=merge_login_at({}, self.tokens.login_at),
+            timeout=self.timeout, max_retries=2,
+        )
+        r.raise_for_status()
+        self.tokens.login_at = r.json()["result"]["LOGINAT"]
+        # Persist refreshed token to config
+        try:
+            cfg: Dict[str, Any] = {}
+            if os.path.exists(CONFIG_PATH):
+                try:
+                    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                        cfg = json.load(f) or {}
+                except Exception:
+                    cfg = {}
+            cfg["login_at"] = self.tokens.login_at
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
                 pass
         except Exception:
-            continue
-    return None
+            pass
+        return self.tokens.login_at
 
-async def collect_chapters_from_section(
-    page: Page,
-    context,
-    novel_url: str,
-    cap: Optional[int],
-    cookies_json: Optional[str],
-    cookies_txt: Optional[str],
-) -> List[Chapter]:
-    chapters: List[Chapter] = []
-    seen: Set[str] = set()
+    def me(self) -> Dict:
+        url = f"{API_BASE}/v1/login/me"
+        r = request_with_retries(
+            self.s, "GET", url,
+            headers=merge_login_at({}, self.tokens.login_at),
+            timeout=self.timeout, allow_refresh=True, refresh_fn=self.refresh,
+        )
+        r.raise_for_status()
+        return r.json()
 
-    try:
-        await page.wait_for_selector(".ch-list-section", timeout=8000)
-    except Exception:
-        print("[info] .ch-list-section not found within 8s; falling back")
-        return chapters
+    def novel(self, novel_id: int) -> Dict:
+        url = f"{API_BASE}/v1/novel"
+        r = request_with_retries(
+            self.s, "GET", url,
+            headers=merge_login_at({}, self.tokens.login_at),
+            params={"novel_no": novel_id},
+            timeout=self.timeout, allow_refresh=True, refresh_fn=self.refresh,
+        )
+        r.raise_for_status()
+        return r.json()
 
-    total = await get_total_chapters(page)
-    per_page = 20
-    total_pages = math.ceil(total / per_page) if total else None
-    print(f"[toc] total_chapters={total}  per_page={per_page}  total_pages={total_pages or 'unknown'}")
+    def episode_list(self, novel_id: int, rows: int) -> Dict:
+        url = f"{API_BASE}/v1/novel/episode/list"
+        r = request_with_retries(
+            self.s, "GET", url,
+            headers=merge_login_at({}, self.tokens.login_at),
+            params={"novel_no": novel_id, "rows": rows, "sort": "ASC"},
+            timeout=self.timeout, allow_refresh=True, refresh_fn=self.refresh,
+        )
+        r.raise_for_status()
+        return r.json()
 
-    cur = await get_current_page_num(page) or 1
-    safety_pages = total_pages or 200
+    def episode_ticket(self, episode_no: int) -> Dict:
+        url = f"{API_BASE}/v1/novel/episode"
+        headers = merge_login_at({}, self.tokens.login_at)
+        params = {"episode_no": episode_no}
+        # Throttle before hitting ticket endpoint to avoid rate limits
+        if self.throttle:
+            time.sleep(self.throttle + random.uniform(0.05, 0.25))
+        r = request_with_retries(
+            self.s, "GET", url,
+            headers=headers, params=params,
+            timeout=self.timeout, allow_refresh=True, refresh_fn=self.refresh, max_retries=4,
+        )
+        r.raise_for_status()
+        return r.json()
 
-    items_tried = 0                        # cap is applied to TRIES (prevents flipping to next page)
-    hard_cap = cap if (cap and cap > 0) else None
+    def episode_content(self, token_t: str) -> Dict:
+        url = f"{API_BASE}/v1/novel/episode/content"
+        # Throttle content fetch too, to be safe
+        if self.throttle:
+            time.sleep(self.throttle + random.uniform(0.05, 0.25))
+        r = request_with_retries(
+            self.s, "GET", url,
+            params={"_t": token_t},
+            timeout=self.timeout, max_retries=3,
+            allow_refresh=True, refresh_fn=self.refresh,
+        )
+        r.raise_for_status()
+        return r.json()
 
-    for _ in range(safety_pages):
-        # if we've already tried enough items, stop right away (no page 2)
-        if hard_cap is not None and items_tried >= hard_cap:
-            break
+# ----------------------------
+# Token extraction (STRICT)
+# ----------------------------
 
-        cur = await get_current_page_num(page) or cur
-        print(f"[toc] page {cur} …")
+def iter_strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from iter_strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from iter_strings(v)
 
-        wrappers = page.locator(".ch-list-section .list-item")
-        count = await wrappers.count()
-        print(f"[toc] items on page {cur}: {count}")
+def extract_t_token(tdata: dict) -> Tuple[Optional[str], Optional[str]]:
+    """Return (token, direct_content_url_or_none).
+    Prefer JWT-like tokens, but accept any non-empty string if present.
+    If using URL, accept any _t value on the official content endpoint.
+    """
+    res = tdata.get("result", {}) if isinstance(tdata, dict) else {}
+    fallback_token: Optional[str] = None
 
-        # only try up to the remaining allowance on this page
-        limit_on_page = count
-        if hard_cap is not None:
-            remaining = hard_cap - items_tried
-            if remaining <= 0:
-                break
-            limit_on_page = min(limit_on_page, remaining)
+    # 1) common keys at result
+    for k in ("_t", "t", "token"):
+        v = res.get(k)
+        if isinstance(v, str) and v:
+            if looks_like_jwt(v):
+                return v, None
+            fallback_token = fallback_token or v
 
-        for i in range(limit_on_page):
-            print(f"[toc]  trying item {i+1}/{count} on page {cur} …")
-            await maybe_reauth(page, context, novel_url, cookies_json, cookies_txt, where="toc-item")
+    # 2) nested dicts under result
+    if isinstance(res, dict):
+        for _, v in res.items():
+            if isinstance(v, dict):
+                for k in ("_t", "t", "token"):
+                    vv = v.get(k)
+                    if isinstance(vv, str) and vv:
+                        if looks_like_jwt(vv):
+                            return vv, None
+                        fallback_token = fallback_token or vv
 
-            wrappers = page.locator(".ch-list-section .list-item")
-            num_txt, title_txt = "", ""
+    # 3) URL that is the official content endpoint with any _t
+    for s in iter_strings(tdata):
+        if isinstance(s, str) and (s.startswith("http://") or s.startswith("https://")):
             try:
-                num_txt = (await wrappers.nth(i).locator(".chapter-number").first.text_content() or "").strip()
+                p = urlparse(s)
+                if p.netloc.endswith("api-global.novelpia.com") and p.path.endswith("/v1/novel/episode/content"):
+                    q = parse_qs(p.query)
+                    cand = (q.get("_t") or [None])[0]
+                    if isinstance(cand, str) and cand:
+                        if looks_like_jwt(cand):
+                            return cand, s
+                        # fallback
+                        fallback_token = fallback_token or cand
             except Exception:
                 pass
+    if fallback_token:
+        return fallback_token, None
+    return None, None
+
+# ----------------------------
+# EPUB Builder
+# ----------------------------
+
+class EpubBuilder:
+    def __init__(self, out_dir: str, debug_dump: bool = False):
+        self.out_dir = out_dir
+        self.debug_dump = debug_dump
+        ensure_dir(out_dir)
+
+    def _fetch_bytes(self, client: NovelpiaClient, url: str) -> Optional[bytes]:
+        try:
+            resp = client.s.get(url, timeout=client.timeout)
+            resp.raise_for_status()
+            return resp.content
+        except Exception:
+            return None
+
+    def build(self, client: NovelpiaClient, novel: Dict, episodes: List[Dict],
+              filename_hint: Optional[str] = None, language: str = "en",
+              author_fallback: str = "Unknown", css_text: Optional[str] = None,
+              novel_id: Optional[int] = None) -> str:
+        nv = novel["result"]["novel"]
+        title = nv.get("novel_name", f"novel_{nv.get('novel_no','')}")
+        writers = novel["result"].get("writer_list") or []
+        author = (writers[0].get("writer_name") if writers and writers[0].get("writer_name") else author_fallback)
+        status = "Completed" if str(nv.get("flag_complete", 0)) == "1" else "Ongoing"
+        description = (nv.get("novel_story") or "").strip()
+
+        book = epub.EpubBook()
+        book.set_identifier(f"novelpia-{nv.get('novel_no')}")
+        book.set_title(title)
+        book.set_language(language)
+        book.add_author(author)
+
+        # Cover
+        cover_url = normalize_url(nv.get("novel_full_img") or nv.get("novel_img") or "")
+        cover_bytes = self._fetch_bytes(client, cover_url) if cover_url else None
+        has_cover = False
+        if cover_bytes:
+            book.set_cover("cover.jpg", cover_bytes)
+            has_cover = True
+
+        # CSS
+        default_css = css_text or (
+            """
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial; line-height: 1.6; }
+            h1, h2, h3 { page-break-after: avoid; }
+            img { max-width: 100%; height: auto; }
+            .epi-title { font-size: 1.4em; font-weight: 600; margin: 0 0 0.6em; }
+            """
+        )
+        style = epub.EpubItem(uid="style", file_name="style/main.css",
+                              media_type="text/css", content=default_css.encode("utf-8"))
+        book.add_item(style)
+
+        spine: List = ["nav"]
+        toc: List = []
+        image_cache: Dict[str, str] = {}
+        img_index = 1
+
+        def add_images_and_rewrite(html_str: str) -> Tuple[str, List[epub.EpubItem]]:
+            nonlocal img_index
+            soup = BeautifulSoup(html_str, "html.parser")
+            added_items: List[epub.EpubItem] = []
+
+            for img in soup.find_all("img"):
+                src = img.get("src")
+                if not src:
+                    continue
+                src = normalize_url(src)
+                if src in image_cache:
+                    img["src"] = image_cache[src]
+                    continue
+
+                path = urlparse(src).path
+                ext = os.path.splitext(path)[1].lower() or ".jpg"
+                if ext not in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+                    ext = ".jpg"
+
+                img_bytes = self._fetch_bytes(client, src)
+                if not img_bytes:
+                    # leave external
+                    continue
+
+                fname = f"images/img_{img_index:05d}{ext}"
+                image_cache[src] = fname
+                img_index += 1
+
+                item = epub.EpubItem(uid=f"img{img_index}", file_name=fname,
+                                     media_type=media_type_from_ext(ext), content=img_bytes)
+                added_items.append(item)
+                img["src"] = fname
+
+            return str(soup), added_items
+
+        for i, ep in enumerate(episodes, 1):
+            epi_no = int(ep["episode_no"])
+            epi_title = ep.get("epi_title") or f"Episode {ep.get('epi_num')}"
+            print(f"[info] ticket for episode {i}; {epi_title} …")
             try:
-                title_txt = (await wrappers.nth(i).locator(".chapter-title").first.text_content() or "").strip()
-            except Exception:
-                pass
-            pretty_title = (f"{num_txt} {title_txt}".strip() or f"Chapter {(len(chapters)+1)}").strip()
-
-            url = await click_item_capture_viewer(page, i, cur_page=cur, novel_url=novel_url)
-            items_tried += 1  # count a try whether or not it yielded a URL
-
-            if not url:
-                # one more quick sniff for nested href
+                tdata = client.episode_ticket(epi_no)
+            except requests.HTTPError as e:
+                # If token expired, refresh and retry once
+                should_retry = False
                 try:
-                    href = await wrappers.nth(i).locator("a[href*='/viewer/']").first.get_attribute("href")
-                    if href:
-                        url = href if href.startswith("http") else (BASE + href)
+                    resp = getattr(e, "response", None)
+                    msg = None
+                    if resp is not None:
+                        try:
+                            body = resp.json()
+                            msg = isinstance(body, dict) and body.get("errmsg")
+                        except Exception:
+                            msg = resp.text if hasattr(resp, "text") else None
+                    if isinstance(msg, str) and "The token has expired." in msg:
+                        try:
+                            client.refresh()
+                            should_retry = True
+                        except Exception:
+                            pass
                 except Exception:
                     pass
-
-            if url and "/viewer/" in url and url not in seen:
-                print(f"[toc]    viewer: {url}")
-                seen.add(url)
-                chapters.append(Chapter(idx=len(chapters) + 1, title=pretty_title, url=url))
-                if hard_cap is not None and len(chapters) >= hard_cap:
-                    return chapters
-
-        # stop if finished or reached last page
-        if (total_pages and cur >= total_pages) or (hard_cap is not None and items_tried >= hard_cap):
-            break
-
-        # next numeric (cur + 1)
-        target = cur + 1
-        if await goto_page(page, target):
-            continue
-
-        # otherwise try one › then smallest visible number
-        try:
-            nxt = page.locator('.pagination .page-btn.arrow:has-text("›")').first
-            if await nxt.count():
-                await nxt.click(timeout=1500)
-                await page.wait_for_timeout(250)
-                nums = page.locator('.pagination .page-btn:not(.arrow)')
-                ncnt = await nums.count()
-                for j in range(ncnt):
-                    t = (await nums.nth(j).text_content() or "").strip()
-                    if t.isdigit():
-                        if await goto_page(page, int(t)):
-                            break
+                if should_retry:
+                    try:
+                        tdata = client.episode_ticket(epi_no)
+                        print(f"[info] retry ticket for episode {i}; {epi_title} …")
+                    except requests.HTTPError as e2:
+                        print(f"[warn] episode_ticket {i}; {epi_title} failed after refresh: {e2} — skipping")
+                        if self.debug_dump:
+                            with open(os.path.join(self.out_dir, f"ticket_{epi_no}.json"), "w", encoding="utf-8") as f:
+                                f.write(getattr(e2, "response", None) and getattr(e2.response, "text", "") or "")
+                        continue
                 else:
-                    break
-            else:
-                break
-        except Exception:
-            break
+                    print(f"[warn] episode_ticket {i}; {epi_title} failed after retries: {e} — skipping")
+                    if self.debug_dump:
+                        with open(os.path.join(self.out_dir, f"ticket_{epi_no}.json"), "w", encoding="utf-8") as f:
+                            f.write(getattr(e, "response", None) and getattr(e.response, "text", "") or "")
+                    continue
 
-    return chapters
+            token_t, direct_url = extract_t_token(tdata)
+            if not token_t and not direct_url:
+                print(f"[warn] no _t token for episode {i}; {epi_title} (eps_no: {epi_no}) — skipping")
+                if self.debug_dump:
+                    with open(os.path.join(self.out_dir, f"ticket_{epi_no}.json"), "w", encoding="utf-8") as f:
+                        json.dump(tdata, f, ensure_ascii=False, indent=2)
+                continue
 
-async def collect_chapters(page: Page, context, novel_url: str, cap: Optional[int], cookies_json: Optional[str], cookies_txt: Optional[str]) -> List[Chapter]:
-    primary = await collect_chapters_from_section(page, context, novel_url, cap, cookies_json, cookies_txt)
-    if primary:
-        return primary
-    return []
-
-# --------- Walk via Next (fallback) ---------
-async def walk_next_chapters(page: Page, start_url: str, max_steps: int = 300) -> List[Chapter]:
-    chapters: List[Chapter] = []
-    seen = set()
-    url = start_url
-    idx = 1
-
-    for _ in range(max_steps):
-        if not url or url in seen:
-            break
-        seen.add(url)
-
-        await safe_goto(page, url)
-        html = await page.content()
-        soup = BeautifulSoup(html, "html.parser")
-        title = soup.title.get_text(strip=True) if soup.title else f"Chapter {idx}"
-        chapters.append(Chapter(idx=idx, title=title or f"Chapter {idx}", url=url))
-
-        next_url = None
-        for label in NEXT_BUTTON_LABELS:
+            # Fetch content
             try:
-                btn = page.get_by_text(re.compile(label, re.I)).first
-                if await btn.is_visible(timeout=1000):
-                    href = await btn.get_attribute("href")
-                    if href:
-                        next_url = href if href.startswith("http") else (BASE + href)
-                    else:
-                        await btn.click(timeout=2000)
-                        await page.wait_for_load_state("networkidle", timeout=8000)
-                        await handle_consent_buttons(page)
-                        next_url = page.url
-                    break
+                if token_t:
+                    cdata = client.episode_content(token_t)
+                else:
+                    r = client.s.get(direct_url, timeout=client.timeout)
+                    r.raise_for_status()
+                    cdata = r.json()
+            except requests.HTTPError as e:
+                # If token expired, refresh and retry once; else skip
+                should_retry = False
+                try:
+                    resp = getattr(e, "response", None)
+                    msg = None
+                    if resp is not None:
+                        try:
+                            body = resp.json()
+                            msg = isinstance(body, dict) and body.get("errmsg")
+                        except Exception:
+                            msg = resp.text if hasattr(resp, "text") else None
+                    if isinstance(msg, str) and "The token has expired." in msg:
+                        try:
+                            client.refresh()
+                            should_retry = True
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                if should_retry:
+                    try:
+                        if token_t:
+                            cdata = client.episode_content(token_t)
+                            print(f"[info] retry ticket for episode {i}; {epi_title} …")
+                        else:
+                            r = client.s.get(direct_url, timeout=client.timeout)
+                            r.raise_for_status()
+                            cdata = r.json()
+                    except requests.HTTPError as e2:
+                        print(f"[warn] content fetch failed after refresh for episode {i}; {epi_title} (eps_no: {epi_no}): {e2}")
+                        if self.debug_dump:
+                            with open(os.path.join(self.out_dir, f"content_{epi_no}.json"), "w", encoding="utf-8") as f:
+                                f.write(getattr(e2, "response", None) and getattr(e2.response, "text", "") or "")
+                        continue
+                else:
+                    print(f"[warn] content fetch failed for episode {i}; {epi_title} (eps_no: {epi_no}: {e}")
+                    if self.debug_dump:
+                        with open(os.path.join(self.out_dir, f"content_{epi_no}.json"), "w", encoding="utf-8") as f:
+                            f.write(getattr(e, "response", None) and getattr(e.response, "text", "") or "")
+                    continue
+
+            # Prefer result.data.epi_content* fields and concatenate
+            result_block = (cdata.get("result", {}) or {})
+            data_block = (result_block.get("data") or {}) if isinstance(result_block, dict) else {}
+            parts = []
+            try:
+                # natural sort by numeric suffix, epi_content, epi_content2, epi_content3...
+                def _key(k: str):
+                    import re as _re
+                    m = _re.search(r"(\d+)$", k)
+                    return (0 if k == "epi_content" else 1, int(m.group(1)) if m else 0)
+                for k in sorted([kk for kk in data_block.keys() if str(kk).startswith("epi_content")], key=_key):
+                    v = data_block.get(k)
+                    if isinstance(v, str) and v:
+                        parts.append(v)
             except Exception:
                 pass
+            html_text = "".join(parts).strip()
+            if not html_text:
+                # fallbacks
+                html_text = (
+                    result_block.get("content")
+                    or result_block.get("html")
+                    or result_block.get("text")
+                    or cdata.get("content")
+                    or ""
+                )
 
-        if not next_url:
-            try:
-                cand = await page.locator("a[rel='next'], a[aria-label*='Next i'], a:has-text('Next')").first.get_attribute("href")
-                if cand:
-                    next_url = cand if cand.startswith("http") else (BASE + cand)
-            except Exception:
-                pass
+            html_text = html_from_episode_text(html_text)
+            html_text, new_imgs = add_images_and_rewrite(html_text)
 
-        if not next_url or next_url == url:
-            break
+            chapter = epub.EpubHtml(
+                title=epi_title,
+                file_name=f"chap_{i:04d}.xhtml",
+                lang=language,
+                content=(
+                    f"<html xmlns=\"http://www.w3.org/1999/xhtml\">"
+                    f"<head><title>{html.escape(epi_title)}</title>"
+                    f"<link rel=\"stylesheet\" href=\"style/main.css\"/></head>"
+                    f"<body><h2 class=\"epi-title\">{html.escape(epi_title)}</h2>{html_text}</body></html>"
+                ),
+            )
 
-        url = next_url
-        idx += 1
-        await page.wait_for_timeout(THROTTLE_MS)
+            book.add_item(chapter)
+            spine.append(chapter)
+            toc.append(chapter)
 
-    return chapters
+            for item in new_imgs:
+                book.add_item(item)
 
-# --------- Comment removal & content extraction ---------
-def _rm_all(soup, selectors):
-    for sel in selectors:
-        for el in soup.select(sel):
-            el.decompose()
+        # About / metadata page
+        src_url = f"{BASE_URL}/novel/{novel_id}" if novel_id else ""
+        meta_parts = []
+        meta_parts.append(f"<h1>{html.escape(title)}</h1>")
+        if has_cover:
+            meta_parts.append("<p><img src='cover.jpg' alt='Cover' style='width:230px;max-width:90%;height:auto;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.15)'/></p>")
+        meta_parts.append(f"<p><strong>Author:</strong> {html.escape(author)}</p>")
+        meta_parts.append(f"<p><strong>Chapters:</strong> {len(episodes)}</p>")
+        meta_parts.append(f"<p><strong>Status:</strong> {html.escape(status)}</p>")
+        if src_url:
+            meta_parts.append(f"<p><strong>Source:</strong> <a href='{src_url}'>{src_url}</a></p>")
+        if description:
+            meta_parts.append(f"<p>{html.escape(description)}</p>")
+        meta_html = (
+            "<html><head><link rel='stylesheet' href='style/main.css'/></head><body>"
+             + "".join(meta_parts) + "</body></html>"
+        )
+        about = epub.EpubHtml(title="About", file_name="about.xhtml", lang=language, content=meta_html)
+        book.add_item(about)
+        spine.insert(1, about)
+        toc.insert(0, about)
 
-def _strip_comment_blocks(node_or_soup):
-    import re as _re
-    root = node_or_soup
-    _rm_all(root, [
-        ".comment-all-wrapper",".comment-header",".comment-write-box",".comment-list-wrapper",
-        ".cmtbox",".comment-txt",".comment-action-btn",".reply-write-input",".btn-reply-input",
-        ".user-info",".user-nic",".input-date",".nv-comments",".comments",".comment","#comments","#comment",
-        "[data-comments]","[data-comment]",
-    ])
-    def is_commentish(tag):
-        if not getattr(tag, "attrs", None): return False
-        cid = " ".join(tag.get("class", [])).lower()
-        tid = (tag.get("id") or "").lower()
-        return ("comment" in cid or "reply" in cid or "comment" in tid or "reply" in tid)
-    for el in list(root.find_all(lambda t: t.name in ("div","section","ul","ol","aside","article") and is_commentish(t))):
-        el.decompose()
-    pat_no_comments = _re.compile(r"^\s*(there (are )?no comments|no comments)\s*$", _re.I)
-    pat_timestamp = _re.compile(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},\s+\d{4}\s+at\s+\d{1,2}:\d{2}\s*(am|pm)\s*$", _re.I)
-    for el in list(root.find_all(["p","div","li"])):
-        txt = (el.get_text(" ", strip=True) or "")
-        if pat_no_comments.match(txt) or pat_timestamp.match(txt) or txt.strip() in {"HOT","NEWEST","ADD"}:
-            parent = el.find_parent(["li","article","div","section"]) or el
-            parent.decompose()
+        # TOC, NCX, Nav
+        book.toc = tuple(toc)
+        book.add_item(epub.EpubNcx())
+        book.add_item(epub.EpubNav())
 
-def extract_readable(html: str, list_title: str = "", novel_title: Optional[str] = None) -> Dict[str, str]:
-    soup = BeautifulSoup(html, "html.parser")
-    _strip_comment_blocks(soup)
-    containers = [
-        "[id*='viewer']", ".viewer", ".view-contents", ".read-contents",
-        "article", ".article", ".reader", ".chapter", ".prose",
-        ".ql-editor", ".content", "[data-reader]", "[data-contents]"
-    ]
-    node = None
-    for sel in containers:
-        cand = soup.select_one(sel)
-        if cand and len(cand.get_text(strip=True)) > 200:
-            node = cand
-            break
-    if not node:
-        paras = [p.get_text(" ", strip=True) for p in soup.select("p") if len(p.get_text(strip=True)) > 10]
-        if not paras:
-            raise RuntimeError("No readable content found (might be gated).")
-        body_html = "".join(f"<p>{hesc(t)}</p>" for t in paras)
-        page_title = soup.title.get_text(strip=True) if soup.title else ""
-        def is_good(t: str) -> bool:
-            if not t: return False
-            s = t.strip()
-            if s.lower().startswith("novelpia -"): return False
-            if novel_title and s.strip() == novel_title.strip(): return False
-            return len(s) >= 4
-        final_title = list_title or (page_title if is_good(page_title) else "Chapter")
-        return {"title": final_title, "html": body_html}
-    _strip_comment_blocks(node)
-    header_title = ""
-    for sel in [".chapter-title", ".ep-title", ".title", "header h1", "h1", "h2"]:
-        h = node.select_one(sel)
-        if h:
-            header_title = h.get_text(" ", strip=True)
-            if header_title:
-                break
-    def is_good(t: str) -> bool:
-        if not t: return False
-        s = t.strip()
-        if s.lower().startswith("novelpia -"): return False
-        if novel_title and s.strip() == novel_title.strip(): return False
-        return len(s) >= 4
-    final_title = header_title if is_good(header_title) else (list_title or header_title or "Chapter")
-    body_html = "".join(str(x) for x in node.contents)
-    return {"title": final_title, "html": body_html}
+        # Spine & CSS
+        book.spine = spine
 
-# --------- EPUB ---------
-async def build_epub(novel: NovelMeta, chapters_payload: List[Dict], out_dir: Path, cover_bytes: Optional[bytes] = None) -> Path:
-    book = epub.EpubBook()
-    book.set_identifier(slugify(novel.title or novel.url))
-    book.set_title(novel.title or "Untitled")
-    if cover_bytes:
-        book.set_cover("cover.jpg", cover_bytes)
-    if novel.author:
-        book.add_author(novel.author)
-    if novel.tags:
-        book.add_metadata('DC', 'subject', ", ".join(novel.tags))
-    if novel.description:
-        book.add_metadata('DC', 'description', novel.description)
+        # kebab-case, lowercase filename
+        import re as _re
+        def _kebab(s: str) -> str:
+            s = (s or "").lower()
+            s = _re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+            return s or "book"
+        base = _kebab(filename_hint or title)
+        # Ensure per-book output folder next to EPUB
+        book_dir = os.path.join(self.out_dir, base)
+        ensure_dir(book_dir)
+        out_path = os.path.join(book_dir, f"{base}.epub")
+        epub.write_epub(out_path, book, {})
+        return out_path
 
-    intro = epub.EpubHtml(title="About", file_name="about.xhtml", lang="en")
-    intro.content = f"""
-    <h1>{hesc(novel.title)}</h1>
-    {"<p><img src='cover.jpg' alt='Cover' style='max-width:100%;height:auto;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.15)'/></p>" if cover_bytes else ""}
-    <p><strong>Author:</strong> {hesc(novel.author or 'Unknown')}</p>
-    <p><strong>Status:</strong> {hesc(novel.status or 'Unknown')}</p>
-    <p><strong>Source:</strong> <a href="{novel.url}">{novel.url}</a></p>
-    <p>{hesc((novel.description or '').strip()[:2000])}</p>
-    """
-    book.add_item(intro)
+# ----------------------------
+# Orchestration
+# ----------------------------
 
-    items = [intro]
-    spine = ['nav', intro]
-    toc = [epub.Link('about.xhtml', 'About', 'about')]
+def fetch_and_build(client: NovelpiaClient, novel_id: int, out_dir: str,
+                    max_chapters: Optional[int], language: str,
+                    debug_dump: bool = False):
+    # Confirm token
+    _res = client.me()
+    try:
+        status_ok = str((_res or {}).get("statusCode")) == "200"
+        code_ok = str((_res or {}).get("code") or "0000") in ("0000", "0")
+        if status_ok and code_ok:
+            mem_nick = (((_res.get("result") or {}).get("login") or {}).get("mem_nick")) or "Unknown"
+            print(f"[auth] Logged in as: {mem_nick}")
+        else:
+            em = (_res or {}).get("errmsg") or "Unknown authentication error"
+            print(f"[auth] Error: {em}")
+    except Exception:
+        pass
+    
+    # Novel data
+    print("[info] extracting metadata…")
+    data_novel = client.novel(novel_id)
+    nv = data_novel["result"]["novel"]
+    title = nv.get("novel_name", f"novel_{novel_id}")
+    epi_cnt = data_novel["result"].get("info", {}).get("epi_cnt") or nv.get("count_epi") or 0
+    writers = data_novel.get("result", {}).get("writer_list") or []
+    author = writers[0].get("writer_name") if writers and writers[0].get("writer_name") else "Unknown"
+    status = "Completed" if str(nv.get("flag_complete", 0)) == "1" else "Ongoing"
+    print(f"[info] title={title!r} author={author!r} chapter={epi_cnt!r} status={status!r}")
 
-    for ch in chapters_payload:
-        idx = ch["idx"]
-        title = (ch["title"] or f"Chapter {idx}").strip()
-        body_html = ch["html"]
-        file_name = f"{str(idx).zfill(4)}.xhtml"
+    # Episode list
+    rows = int(epi_cnt) if epi_cnt else 1000
+    data_list = client.episode_list(novel_id, rows=rows)
+    ep_list = data_list["result"].get("list", [])
 
-        chap = epub.EpubHtml(title=title, file_name=file_name, lang="en")
-        chap.content = f"<h2>{hesc(title)}</h2>\n{body_html}"
-        book.add_item(chap)
-        items.append(chap)
-        spine.append(chap)
-        toc.append(epub.Link(file_name, title, f"ch{idx}"))
+    # Optional cap on number of chapters (ascending order)
+    if max_chapters is not None and max_chapters > 0:
+        ep_list = ep_list[: int(max_chapters)]
 
-    book.toc = tuple(toc)
-    book.spine = spine
-    book.add_item(epub.EpubNcx())
-    book.add_item(epub.EpubNav())
-    css = epub.EpubItem(uid="style_nav", file_name="style/style.css", media_type="text/css",
-                        content="body{font-family:serif;line-height:1.5} h1,h2{font-family:sans-serif}")
-    book.add_item(css)
+    builder = EpubBuilder(out_dir, debug_dump=debug_dump)
+    out_file = builder.build(
+        client=client,
+        novel=data_novel,
+        episodes=ep_list,
+        filename_hint=title,
+        language=language,
+        novel_id=novel_id,
+    )
+    
+    # Persist metadata and chapter list alongside the EPUB
+    try:
+        # Write metadata next to the generated EPUB file
+        book_dir = os.path.dirname(out_file)
+        nv = data_novel.get("result", {}).get("novel", {})
+        # tags can be in result.tag_list or novel.tag_list, accept str or dict with name fields
+        tag_items = (data_novel.get("result", {}).get("tag_list")
+                     or nv.get("tag_list")
+                     or [])
+        tags: List[str] = []
+        for t in tag_items:
+            if isinstance(t, str):
+                tags.append(t)
+            elif isinstance(t, dict):
+                val = t.get("tag_name") or t.get("name") or t.get("title")
+                if isinstance(val, str):
+                    tags.append(val)
+        # unique while preserving order
+        seen = set()
+        uniq_tags = []
+        for t in tags:
+            if t not in seen:
+                seen.add(t)
+                uniq_tags.append(t)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{slugify(novel.title) or 'novel'}.epub"
-    epub.write_epub(str(out_path), book, {})
-    return out_path
+        meta = {
+            "url": f"https://global.novelpia.com/novel/{novel_id}",
+            "title": nv.get("novel_name") or title,
+            "author": author,
+            "tags": uniq_tags,
+            "chapter": len(ep_list) if (max_chapters and max_chapters > 0) else (int(epi_cnt) if epi_cnt else len(ep_list)),
+            "status": status,
+            "description": nv.get("novel_story") or "",
+        }
+        meta_path = os.path.join(book_dir, "metadata.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
 
-# --------- Main ---------
-async def main():
-    ap = argparse.ArgumentParser(description="Novelpia → EPUB (supports cookies.txt and virtual list TOC).")
-    ap.add_argument("--url", required=True, help="Novel URL, e.g. https://global.novelpia.com/novel/1213")
-    ap.add_argument("--cookies-json", help="Playwright/Chrome storageState JSON (optional)")
-    ap.add_argument("--cookies-txt", help="Netscape cookies.txt (optional)")
-    ap.add_argument("--out", default="output", help="Output folder (default: output/)")
-    ap.add_argument("--max-chapters", type=int, default=0, help="Stop after N TOC items (0 = no cap)")
-    ap.add_argument("--no-headless", action="store_true", help="Run a visible browser window (debug)")
+        chapters_path = os.path.join(book_dir, "chapters.jsonl")
+        with open(chapters_path, "w", encoding="utf-8") as f:
+            for idx, ep in enumerate(ep_list, 1):
+                epi_no = int(ep.get("episode_no"))
+                epi_title = ep.get("epi_title") or f"Episode {ep.get('epi_num')}"
+                rec = {"idx": idx, "title": epi_title, "url": f"https://global.novelpia.com/viewer/{epi_no}"}
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        # Non-fatal; EPUB has already been written
+        pass
+    return out_file, title, len(ep_list)
+
+# ----------------------------
+# Main
+# ----------------------------
+
+def main():
+    ap = argparse.ArgumentParser(description="Novelpia → EPUB packer (API)")
+    ap.add_argument("novel_id", type=int, help="novel_no (e.g., 1072)")
+    ap.add_argument("--user", "--email", "-u", "-e", dest="email", help="Novelpia email (overrides config tokens if provided)")
+    ap.add_argument("--pass", "--password", "-p", dest="password", help="Novelpia password (overrides config tokens if provided)")
+    ap.add_argument("--out", default="output", help="Output directory")
+    ap.add_argument("--max-chapters", "-max", type=int, default=0, help="Fetch up to N chapters (0 = all)")
+    ap.add_argument("--lang", default="en", help="EPUB language code (default: en)")
+    ap.add_argument("--proxy", default=None, help="HTTP/HTTPS proxy, e.g. http://host:port")
+    ap.add_argument("--debug", "-v", action="store_true", help="Enable verbose HTTP request/response logs and extra diagnostics")
+    ap.add_argument("--throttle", type=float, default=2.0, help="Seconds delay between episode requests (default: 2.0)")
     args = ap.parse_args()
 
-    from urllib.parse import urlparse
-    # robots soft-check (fail open if error)
+    global HTTP_LOG
+    HTTP_LOG = bool(args.debug)
+
+    # Config helpers
+    def load_config() -> Dict[str, Any]:
+        try:
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    return json.load(f) or {}
+        except Exception:
+            return {}
+        return {}
+
+    def save_config(cfg: Dict[str, Any]) -> None:
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    cfg = load_config()
+    cfg_login_at = (cfg.get("login_at") or "").strip() or None
+    cfg_userkey = (cfg.get("userkey") or "").strip() or None
+    cfg_tkey = (cfg.get("tkey") or "").strip() or None
+
+    # Priority: CLI credentials > stored tokens > error
+    if args.email and args.password:
+        client = NovelpiaClient(email=args.email, password=args.password, proxy=args.proxy,
+                                throttle=args.throttle, userkey=cfg_userkey, tkey=cfg_tkey)
+        client.login()
+        # Persist/refresh tokens after successful login
+        userkey_val = None
+        tkey_val = None
+        try:
+            for c in client.s.cookies:
+                if c.name == "USERKEY":
+                    userkey_val = c.value
+                elif c.name == "TKEY":
+                    tkey_val = c.value
+        except Exception:
+            pass
+        save_config({
+            "login_at": client.tokens.login_at,
+            "userkey": userkey_val or cfg_userkey or "",
+            "tkey": tkey_val or client.tokens.tkey or cfg_tkey or "",
+        })
+    elif cfg_login_at and cfg_userkey:
+        client = NovelpiaClient(email=None, password=None, proxy=args.proxy,
+                                throttle=args.throttle, userkey=cfg_userkey, tkey=cfg_tkey)
+        client.tokens.login_at = cfg_login_at
+    else:
+        print("[error] No credentials or stored tokens found. Provide --user and --pass to login once.")
+        sys.exit(2)
+
     try:
-        async with httpx.AsyncClient(timeout=15, headers={"User-Agent": DEFAULT_UA}) as client:
-            r = await client.get(ROBOTS_URL)
-            r.raise_for_status()
-            path = urlparse(args.url).path or "/"
-            if "Disallow: /" in r.text and path.startswith("/"):
-                print("[blocked] robots.txt disallows this path.")
-    except Exception:
-        pass
-
-    out_dir = Path(args.out)
-
-    async with async_playwright() as p:
-        browser: Browser = await p.chromium.launch(
-            headless=not args.no_headless,
-            args=["--disable-blink-features=AutomationControlled"]
+        out_file, title, count = fetch_and_build(
+            client, args.novel_id, args.out,
+            max_chapters=(args.max_chapters if args.max_chapters and args.max_chapters > 0 else None),
+            language=args.lang, debug_dump=args.debug
         )
-        context = await browser.new_context(
-            user_agent=DEFAULT_UA,
-            locale="en-US",
-            viewport={"width": 1280, "height": 2100},
-        )
-        context.set_default_timeout(6000)
-        context.set_default_navigation_timeout(15000)
-        await ensure_login(context, args.cookies_json, args.cookies_txt)
-        page: Page = await context.new_page()
+    except requests.HTTPError as e:
+        resp = getattr(e, 'response', None)
+        em = _extract_errmsg_from_response(resp)
+        em_part = f" | errmsg: {em}" if em else ""
+        print(f"[error] HTTP error: {e}{em_part}")
+        sys.exit(1)
 
-        print(f"[nav] {args.url}")
-        await safe_goto(page, args.url)
-
-        novel = await extract_meta(page, args.url)
-        cover_bytes = await fetch_cover_bytes_from_page(page)
-        novel_slug = slugify(novel.title or "novelpia")
-        book_dir = out_dir / novel_slug
-        book_dir.mkdir(parents=True, exist_ok=True)
-
-        print("[stage] collecting chapters…")
-        chapters = await collect_chapters(
-            page, context, novel_url=args.url,
-            cap=(args.max_chapters or None),
-            cookies_json=args.cookies_json,
-            cookies_txt=args.cookies_txt,
-        )
-        print(f"[stage] collected {len(chapters)} entries from TOC")
-        print(f"[ok] discovered {len(chapters)} potential entries")
-
-        only_non_viewer = chapters and all("/viewer/" not in c.url for c in chapters)
-        if not chapters or only_non_viewer:
-            print("[info] TOC incomplete; trying to seed /viewer/ and walk via Next…")
-            start_url = None
-            for label in START_BUTTON_LABELS:
-                try:
-                    btn = page.get_by_text(re.compile(label, re.I)).first
-                    if await btn.is_visible(timeout=1000):
-                        await btn.click(timeout=2500)
-                        await page.wait_for_load_state("networkidle", timeout=8000)
-                        await handle_consent_buttons(page)
-                        start_url = page.url
-                        break
-                except Exception:
-                    pass
-            if not start_url:
-                try:
-                    found = await page.evaluate("""
-                    () => {
-                      const urls = [];
-                      document.querySelectorAll('a[href]').forEach(a => {
-                        const h=a.getAttribute('href'); if (/\\/viewer\\//.test(h||'')) urls.push(h);
-                      });
-                      return urls[0] || null;
-                    }
-                    """)
-                    if found:
-                        start_url = found if found.startswith("http") else (BASE + found)
-                except Exception:
-                    pass
-
-            if start_url and "/viewer/" in start_url:
-                lim = args.max_chapters if args.max_chapters and args.max_chapters > 0 else 300
-                walked = await walk_next_chapters(page, start_url=start_url, max_steps=lim)
-                if walked:
-                    chapters = walked
-                    print(f"[ok] walked {len(chapters)} chapters via Next")
-
-        # de-dup and cap again (safety)
-        dedup: Dict[str, Chapter] = {}
-        for c in chapters:
-            if c.url not in dedup and ("/viewer/" in c.url):
-                dedup[c.url] = c
-        chapters = list(dedup.values())
-        chapters.sort(key=lambda c: c.idx)
-        if args.max_chapters and args.max_chapters > 0:
-            chapters = chapters[:args.max_chapters]
-
-        if not chapters:
-            print("[warn] No /viewer/ chapters discovered. EPUB will include About page only.")
-        else:
-            print(f"[ok] using {len(chapters)} /viewer/ chapters")
-
-        # Fetch content
-        payloads: List[Dict[str, Any]] = []
-        for ch in chapters:
-            if "/viewer/" not in ch.url:
-                continue
-            try:
-                print(f"[open] {ch.idx:03d} {ch.title} -> {ch.url}")
-                await safe_goto(page, ch.url)
-
-                html = await page.content()
-                data = extract_readable(html, list_title=ch.title, novel_title=novel.title)
-                title = data["title"].strip() or ch.title
-                payloads.append({"idx": ch.idx, "title": title, "html": data["html"]})
-                await page.wait_for_timeout(THROTTLE_MS)
-            except Exception as e:
-                print(f"[skip] {ch.idx:03d} {ch.title}: {e}")
-                await page.wait_for_timeout(THROTTLE_MS)
-
-        # Persist metadata & chapter list
-        (book_dir / "metadata.json").write_text(json.dumps(asdict(novel), ensure_ascii=False, indent=2), "utf-8")
-        with (book_dir / "chapters.jsonl").open("w", encoding="utf-8") as f:
-            for ch in chapters:
-                f.write(json.dumps(asdict(ch), ensure_ascii=False) + "\n")
-
-        out_path = await build_epub(novel, payloads, book_dir, cover_bytes=cover_bytes)
-        print(f"[success] EPUB created at: {out_path}")
-
-        await context.close()
-        await browser.close()
+    print(f"[success] Wrote EPUB: {out_file}  |  Title: {title}  |  Chapters: {count}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[warn] aborted by user")
+        sys.exit(130)
