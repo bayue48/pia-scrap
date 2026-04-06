@@ -1,6 +1,6 @@
 # PIA SCRAP (API): Novelpia → EPUB
 
-Create a clean EPUB from a Novelpia novel using Novelpia’s API. Given a `novel_id` (e.g., `49`), the script fetches the novel data, episode list, pulls episode data, embeds images and cover, and writes a nicely structured EPUB with metadata.
+Create a clean EPUB from a Novelpia novel using Novelpia’s API. Given a `novel_id` (e.g., `49` or `47-50`), the script fetches the novel data, episode list, pulls episode data, embeds images and cover, and writes a nicely structured EPUB with metadata.
 
 > Use responsibly. Only download what your account can legitimately access. Respect Novelpia’s Terms and copyright.
 
@@ -49,7 +49,7 @@ python main.py NOVEL_ID [--user EMAIL] [--pass PASSWORD]
 
 Arguments
 
-* `NOVEL_ID` (positional) — numeric `novel_no`, e.g. `49`.
+* `NOVEL_ID` (positional) — numeric/range `novel_no`, e.g. `49` or `47-50`.
 * `--user`, `--pass` — login once; tokens saved to `.api.json` for reuse.
 * `--out` — output directory (default: `output`).
 * `--max-chapters` — fetch up to N episodes (0 or unset = all).
@@ -58,6 +58,7 @@ Arguments
 * `--throttle` — seconds to wait between episode/ticket/content calls (default `2.0`).
 * `--debug` — verbose request logs and optional JSON dumps for failures.
 * `--txt` — export as txt per episode
+* `--update` — generates/accesses a local cache to update existing EPUBs without redownloading older chapters
 
 ---
 
@@ -84,6 +85,7 @@ Output files are written under `output/<title>/`:
 ```
 output/<title>/<title>.epub or output/<title>/<episode-title>.txt
 ```
+(If --update is used, a .raw_cache/ folder will also be generated here).
 
 ---
 
