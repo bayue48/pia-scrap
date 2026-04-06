@@ -33,13 +33,22 @@ class EpubBuilder:
     def build(self, client: NovelpiaClient, novel: Dict, episodes: List[Dict],
               filename_hint: Optional[str] = None, language: str = "en",
               author_fallback: str = "Unknown", css_text: Optional[str] = None,
-              novel_id: Optional[int] = None) -> str:
+              novel_id: Optional[int] = None, update_mode: bool = False) -> Tuple[str, str, int]:
         nv = novel["result"]["novel"]
         title = nv.get("novel_name", f"novel_{nv.get('novel_no','')}")
         writers = novel["result"].get("writer_list") or []
         author = (writers[0].get("writer_name") if writers and writers[0].get("writer_name") else author_fallback)
         status = "Completed" if str(nv.get("flag_complete", 0)) == "1" else "Ongoing"
         description = (nv.get("novel_story") or "").strip()
+
+        base = kebab(filename_hint or title)
+        book_dir = os.path.join(self.out_dir, base)
+        ensure_dir(book_dir)
+
+        # Setup cache directory
+        cache_dir = os.path.join(book_dir, ".raw_cache")
+        if update_mode:
+            ensure_dir(cache_dir)
 
         book = epub.EpubBook()
         book.set_identifier(f"novelpia-{nv.get('novel_no')}")
@@ -111,103 +120,107 @@ class EpubBuilder:
         for i, ep in enumerate(episodes, 1):
             epi_no = int(ep["episode_no"])
             epi_title = ep.get("epi_title") or f"Episode {ep.get('epi_num')}"
-            print(f"[info] ticket for episode {i}; {epi_title} …")
-            try:
-                tdata = client.episode_ticket(epi_no)
-            except requests.HTTPError as e:
-                # If token expired, refresh and retry once
-                should_retry = False
+            
+            cdata = None
+            cache_file = os.path.join(cache_dir, f"{epi_no}.json") if update_mode else None
+
+            # Local cache check
+            if update_mode and cache_file and os.path.exists(cache_file):
                 try:
-                    resp = getattr(e, "response", None)
-                    msg = None
-                    if resp is not None:
-                        try:
-                            body = resp.json()
-                            msg = isinstance(body, dict) and body.get("errmsg")
-                        except Exception:
-                            msg = resp.text if hasattr(resp, "text") else None
-                    if isinstance(msg, str) and "The token has expired." in msg:
-                        try:
-                            client.refresh()
-                            should_retry = True
-                        except Exception:
-                            pass
+                    with open(cache_file, "r", encoding="utf-8") as f:
+                        cdata = json.load(f)
+                    print(f"[info] loaded cached episode {i}; {epi_title}")
                 except Exception:
                     pass
-                if should_retry:
-                    try:
-                        tdata = client.episode_ticket(epi_no)
-                        print(f"[info] retry ticket for episode {i}; {epi_title} …")
-                    except requests.HTTPError as e2:
-                        print(f"[warn] episode_ticket {i}; {epi_title} failed after refresh: {e2} — skipping")
-                        if self.debug_dump:
-                            with open(os.path.join(self.out_dir, f"ticket_{epi_no}.json"), "w", encoding="utf-8") as f:
-                                f.write(getattr(e2, "response", None) and getattr(e2.response, "text", "") or "")
-                        continue
-                else:
-                    print(f"[warn] episode_ticket {i}; {epi_title} failed after retries: {e} — skipping")
-                    if self.debug_dump:
-                        with open(os.path.join(self.out_dir, f"ticket_{epi_no}.json"), "w", encoding="utf-8") as f:
-                            f.write(getattr(e, "response", None) and getattr(e.response, "text", "") or "")
-                    continue
 
-            token_t, direct_url = extract_t_token(tdata)
-            if not token_t and not direct_url:
-                print(f"[warn] no _t token for episode {i}; {epi_title} (eps_no: {epi_no}) — skipping")
-                if self.debug_dump:
-                    with open(os.path.join(self.out_dir, f"ticket_{epi_no}.json"), "w", encoding="utf-8") as f:
-                        json.dump(tdata, f, ensure_ascii=False, indent=2)
-                continue
-
-            # Fetch content
-            try:
-                if token_t:
-                    cdata = client.episode_content(token_t)
-                else:
-                    r = client.s.get(direct_url, timeout=client.timeout)
-                    r.raise_for_status()
-                    cdata = r.json()
-            except requests.HTTPError as e:
-                # If token expired, refresh and retry once; else skip
-                should_retry = False
+            # API fetch
+            if not cdata:
+                print(f"[info] ticket for episode {i}; {epi_title} …")
                 try:
-                    resp = getattr(e, "response", None)
-                    msg = None
-                    if resp is not None:
-                        try:
-                            body = resp.json()
-                            msg = isinstance(body, dict) and body.get("errmsg")
-                        except Exception:
-                            msg = resp.text if hasattr(resp, "text") else None
-                    if isinstance(msg, str) and "The token has expired." in msg:
-                        try:
-                            client.refresh()
-                            should_retry = True
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                if should_retry:
+                    tdata = client.episode_ticket(epi_no)
+                except requests.HTTPError as e:
+                    should_retry = False
                     try:
-                        if token_t:
-                            cdata = client.episode_content(token_t)
+                        resp = getattr(e, "response", None)
+                        msg = None
+                        if resp is not None:
+                            try:
+                                body = resp.json()
+                                msg = isinstance(body, dict) and body.get("errmsg")
+                            except Exception:
+                                msg = resp.text if hasattr(resp, "text") else None
+                        if isinstance(msg, str) and "The token has expired." in msg:
+                            try:
+                                client.refresh()
+                                should_retry = True
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    if should_retry:
+                        try:
+                            tdata = client.episode_ticket(epi_no)
                             print(f"[info] retry ticket for episode {i}; {epi_title} …")
-                        else:
-                            r = client.s.get(direct_url, timeout=client.timeout)
-                            r.raise_for_status()
-                            cdata = r.json()
-                    except requests.HTTPError as e2:
-                        print(f"[warn] content fetch failed after refresh for episode {i}; {epi_title} (eps_no: {epi_no}): {e2}")
-                        if self.debug_dump:
-                            with open(os.path.join(self.out_dir, f"content_{epi_no}.json"), "w", encoding="utf-8") as f:
-                                f.write(getattr(e2, "response", None) and getattr(e2.response, "text", "") or "")
+                        except requests.HTTPError as e2:
+                            print(f"[warn] episode_ticket {i}; {epi_title} failed after refresh: {e2} — skipping")
+                            continue
+                    else:
+                        print(f"[warn] episode_ticket {i}; {epi_title} failed after retries: {e} — skipping")
                         continue
-                else:
-                    print(f"[warn] content fetch failed for episode {i}; {epi_title} (eps_no: {epi_no}: {e}")
-                    if self.debug_dump:
-                        with open(os.path.join(self.out_dir, f"content_{epi_no}.json"), "w", encoding="utf-8") as f:
-                            f.write(getattr(e, "response", None) and getattr(e.response, "text", "") or "")
+
+                token_t, direct_url = extract_t_token(tdata)
+                if not token_t and not direct_url:
+                    print(f"[warn] no _t token for episode {i}; {epi_title} (eps_no: {epi_no}) — skipping")
                     continue
+
+                try:
+                    if token_t:
+                        cdata = client.episode_content(token_t)
+                    else:
+                        r = client.s.get(direct_url, timeout=client.timeout)
+                        r.raise_for_status()
+                        cdata = r.json()
+                except requests.HTTPError as e:
+                    should_retry = False
+                    try:
+                        resp = getattr(e, "response", None)
+                        msg = None
+                        if resp is not None:
+                            try:
+                                body = resp.json()
+                                msg = isinstance(body, dict) and body.get("errmsg")
+                            except Exception:
+                                msg = resp.text if hasattr(resp, "text") else None
+                        if isinstance(msg, str) and "The token has expired." in msg:
+                            try:
+                                client.refresh()
+                                should_retry = True
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    if should_retry:
+                        try:
+                            if token_t:
+                                cdata = client.episode_content(token_t)
+                                print(f"[info] retry ticket for episode {i}; {epi_title} …")
+                            else:
+                                r = client.s.get(direct_url, timeout=client.timeout)
+                                r.raise_for_status()
+                                cdata = r.json()
+                        except requests.HTTPError as e2:
+                            print(f"[warn] content fetch failed after refresh for episode {i}; {epi_title} (eps_no: {epi_no}): {e2}")
+                            continue
+                    else:
+                        print(f"[warn] content fetch failed for episode {i}; {epi_title} (eps_no: {epi_no}: {e}")
+                        continue
+                
+                if update_mode and cdata and cache_file:
+                    try:
+                        with open(cache_file, "w", encoding="utf-8") as f:
+                            json.dump(cdata, f, ensure_ascii=False)
+                    except Exception:
+                        pass
 
             # Prefer result.data.epi_content* fields and concatenate
             result_block = (cdata.get("result", {}) or {})
@@ -288,9 +301,7 @@ class EpubBuilder:
         # Spine & CSS
         book.spine = spine
 
-        base = kebab(filename_hint or title)
-        book_dir = os.path.join(self.out_dir, base)
-        ensure_dir(book_dir)
         out_path = os.path.join(book_dir, f"{base}.epub")
         epub.write_epub(out_path, book, {})
+        
         return out_path, title, len(episodes)
