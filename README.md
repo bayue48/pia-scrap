@@ -41,7 +41,7 @@ pip install -r requirements.txt
 ## CLI
 
 ```
-python pia.py NOVEL_ID [--user EMAIL] [--pass PASSWORD]
+python main.py NOVEL_ID [--user EMAIL] [--pass PASSWORD]
                    [--out DIR] [--max-chapters N]
                    [--lang en] [--proxy URL] [--throttle SECONDS]
                    [--debug]
@@ -57,6 +57,7 @@ Arguments
 * `--proxy` — HTTP/HTTPS proxy, e.g. `http://host:port`.
 * `--throttle` — seconds to wait between episode/ticket/content calls (default `2.0`).
 * `--debug` — verbose request logs and optional JSON dumps for failures.
+* `--txt` — export as txt per episode
 
 ---
 
@@ -65,30 +66,23 @@ Arguments
 1) First run with your Novelpia credentials (tokens are persisted to `.api.json`):
 
 ```bash
-python pia.py 49 --user you@example.com --pass "your-password"
+python main.py 49 --user you@example.com --pass "your-password"
 ```
 
 2) Subsequent runs can reuse stored tokens (no password on the command line):
 
 ```bash
-python pia.py 49
+python main.py 49
 ```
 
 ---
 
 ## Output Details
 
-Alongside the EPUB, the tool writes:
-
-* `metadata.json` — title, author, tags (when available), total chapters, status, description, source URL.
-* `chapters.jsonl` — one JSON line per chapter: index, title, URL of the web reader for that episode.
-
 Output files are written under `output/<title>/`:
 
 ```
-output/<title>/<title>.epub
-output/<title>/metadata.json
-output/<title>/chapters.jsonl
+output/<title>/<title>.epub or output/<title>/<episode-title>.txt
 ```
 
 ---
