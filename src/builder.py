@@ -2,7 +2,6 @@
 import os
 
 from bs4 import BeautifulSoup
-
 from src.epub import EpubBuilder
 from src.helper import ensure_dir, kebab, sanitize_filename
 from src.novel import fetch_episode_content, fetch_novel_and_episodes

@@ -1,13 +1,12 @@
 import html
 import json
 import os
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
-
-from bs4 import BeautifulSoup
-from ebooklib import epub
 import requests
 
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+from bs4 import BeautifulSoup
+from ebooklib import epub
 from src.api import NovelpiaClient
 from src.const import BASE_URL
 from src.helper import ensure_dir, extract_t_token, kebab, media_type_from_ext, normalize_url

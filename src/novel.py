@@ -1,5 +1,6 @@
-from bs4 import BeautifulSoup
 import requests
+
+from bs4 import BeautifulSoup
 from src.helper import extract_t_token, normalize_url
 
 # ----------------------------
