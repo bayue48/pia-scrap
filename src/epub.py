@@ -2,11 +2,13 @@ import html
 import json
 import os
 import requests
+import time
 
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from ebooklib import epub
+from tqdm import tqdm
 from src.api import NovelpiaClient
 from src.const import BASE_URL
 from src.helper import ensure_dir, extract_t_token, kebab, media_type_from_ext, normalize_url
@@ -23,12 +25,20 @@ class EpubBuilder:
         ensure_dir(out_dir)
 
     def _fetch_bytes(self, client: NovelpiaClient, url: str) -> Optional[bytes]:
-        try:
-            resp = client.s.get(url, timeout=client.timeout)
-            resp.raise_for_status()
-            return resp.content
-        except Exception:
-            return None
+        for attempt in range(1, 4):
+            try:
+                resp = client.s.get(url, timeout=client.timeout)
+                if resp.status_code == 429:
+                    wait = 2.0 * attempt
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                return resp.content
+            except Exception:
+                if attempt < 3:
+                    time.sleep(1.0)
+                continue
+        return None
 
     def build(self, client: NovelpiaClient, novel: Dict, episodes: List[Dict],
               filename_hint: Optional[str] = None, language: str = "en",
@@ -108,135 +118,24 @@ class EpubBuilder:
 
             return str(soup), added_items
 
-        for i, ep in enumerate(episodes, 1):
-            epi_no = int(ep["episode_no"])
-            epi_title = ep.get("epi_title") or f"Episode {ep.get('epi_num')}"
-            print(f"[info] ticket for episode {i}; {epi_title} …")
-            try:
-                tdata = client.episode_ticket(epi_no)
-            except requests.HTTPError as e:
-                # If token expired, refresh and retry once
-                should_retry = False
-                try:
-                    resp = getattr(e, "response", None)
-                    msg = None
-                    if resp is not None:
-                        try:
-                            body = resp.json()
-                            msg = isinstance(body, dict) and body.get("errmsg")
-                        except Exception:
-                            msg = resp.text if hasattr(resp, "text") else None
-                    if isinstance(msg, str) and "The token has expired." in msg:
-                        try:
-                            client.refresh()
-                            should_retry = True
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                if should_retry:
-                    try:
-                        tdata = client.episode_ticket(epi_no)
-                        print(f"[info] retry ticket for episode {i}; {epi_title} …")
-                    except requests.HTTPError as e2:
-                        print(f"[warn] episode_ticket {i}; {epi_title} failed after refresh: {e2} — skipping")
-                        if self.debug_dump:
-                            with open(os.path.join(self.out_dir, f"ticket_{epi_no}.json"), "w", encoding="utf-8") as f:
-                                f.write(getattr(e2, "response", None) and getattr(e2.response, "text", "") or "")
-                        continue
-                else:
-                    print(f"[warn] episode_ticket {i}; {epi_title} failed after retries: {e} — skipping")
-                    if self.debug_dump:
-                        with open(os.path.join(self.out_dir, f"ticket_{epi_no}.json"), "w", encoding="utf-8") as f:
-                            f.write(getattr(e, "response", None) and getattr(e.response, "text", "") or "")
-                    continue
+        # Fetch episodes in parallel
+        pbar = tqdm(total=len(episodes), desc="Fetching chapters", unit="chap")
+        
+        def update_pbar():
+            pbar.update(1)
 
-            token_t, direct_url = extract_t_token(tdata)
-            if not token_t and not direct_url:
-                print(f"[warn] no _t token for episode {i}; {epi_title} (eps_no: {epi_no}) — skipping")
-                if self.debug_dump:
-                    with open(os.path.join(self.out_dir, f"ticket_{epi_no}.json"), "w", encoding="utf-8") as f:
-                        json.dump(tdata, f, ensure_ascii=False, indent=2)
+        fetched_results = client.fetch_episodes_parallel(episodes, progress_cb=update_pbar)
+        pbar.close()
+
+        for i, res in enumerate(fetched_results, 1):
+            if not res or "error" in res:
+                err = res.get("error") if res else "Unknown error"
+                print(f"[warn] Failed to fetch chapter {i}: {err}")
                 continue
 
-            # Fetch content
-            try:
-                if token_t:
-                    cdata = client.episode_content(token_t)
-                else:
-                    r = client.s.get(direct_url, timeout=client.timeout)
-                    r.raise_for_status()
-                    cdata = r.json()
-            except requests.HTTPError as e:
-                # If token expired, refresh and retry once; else skip
-                should_retry = False
-                try:
-                    resp = getattr(e, "response", None)
-                    msg = None
-                    if resp is not None:
-                        try:
-                            body = resp.json()
-                            msg = isinstance(body, dict) and body.get("errmsg")
-                        except Exception:
-                            msg = resp.text if hasattr(resp, "text") else None
-                    if isinstance(msg, str) and "The token has expired." in msg:
-                        try:
-                            client.refresh()
-                            should_retry = True
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                if should_retry:
-                    try:
-                        if token_t:
-                            cdata = client.episode_content(token_t)
-                            print(f"[info] retry ticket for episode {i}; {epi_title} …")
-                        else:
-                            r = client.s.get(direct_url, timeout=client.timeout)
-                            r.raise_for_status()
-                            cdata = r.json()
-                    except requests.HTTPError as e2:
-                        print(f"[warn] content fetch failed after refresh for episode {i}; {epi_title} (eps_no: {epi_no}): {e2}")
-                        if self.debug_dump:
-                            with open(os.path.join(self.out_dir, f"content_{epi_no}.json"), "w", encoding="utf-8") as f:
-                                f.write(getattr(e2, "response", None) and getattr(e2.response, "text", "") or "")
-                        continue
-                else:
-                    print(f"[warn] content fetch failed for episode {i}; {epi_title} (eps_no: {epi_no}: {e}")
-                    if self.debug_dump:
-                        with open(os.path.join(self.out_dir, f"content_{epi_no}.json"), "w", encoding="utf-8") as f:
-                            f.write(getattr(e, "response", None) and getattr(e.response, "text", "") or "")
-                    continue
-
-            # Prefer result.data.epi_content* fields and concatenate
-            result_block = (cdata.get("result", {}) or {})
-            data_block = (result_block.get("data") or {}) if isinstance(result_block, dict) else {}
-            parts = []
-            try:
-                # natural sort by numeric suffix, epi_content, epi_content2, epi_content3...
-                def _key(k: str):
-                    import re as _re
-                    m = _re.search(r"(\d+)$", k)
-                    return (0 if k == "epi_content" else 1, int(m.group(1)) if m else 0)
-                for k in sorted([kk for kk in data_block.keys() if str(kk).startswith("epi_content")], key=_key):
-                    v = data_block.get(k)
-                    if isinstance(v, str) and v:
-                        parts.append(v)
-            except Exception:
-                pass
-            html_text = "".join(parts).strip()
-            if not html_text:
-                # fallbacks
-                html_text = (
-                    result_block.get("content")
-                    or result_block.get("html")
-                    or result_block.get("text")
-                    or cdata.get("content")
-                    or ""
-                )
-
-            html_text = html_from_episode_text(html_text)
+            html_text = res["html"]
+            epi_title = res["epi_title"]
+            
             html_text, new_imgs = add_images_and_rewrite(html_text)
 
             chapter = epub.EpubHtml(

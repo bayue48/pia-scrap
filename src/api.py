@@ -4,10 +4,11 @@ import random
 import time
 import uuid
 import requests
+import concurrent.futures
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
-from src.const import API_BASE, CONFIG_PATH, HTTP_LOG, SESSION_HEADERS
+from typing import Any, Dict, List, Optional
+from src import const
 from src.helper import _j, _mask_kv, attach_auth_cookies, merge_login_at
 
 # ----------------------------
@@ -25,7 +26,7 @@ class NovelpiaClient:
                  proxy: Optional[str] = None, timeout: int = 30, throttle: float = 2.0,
                  userkey: Optional[str] = None, tkey: Optional[str] = None):
         self.s = requests.Session()
-        self.s.headers.update(SESSION_HEADERS.copy())
+        self.s.headers.update(const.SESSION_HEADERS.copy())
         if proxy:
             self.s.proxies.update({"http": proxy, "https": proxy})
         self.timeout = timeout
@@ -46,7 +47,7 @@ class NovelpiaClient:
             print(f"Error setting cookies: {e}")
 
     def login(self):
-        url = f"{API_BASE}/v1/member/login"
+        url = f"{const.API_BASE}/v1/member/login"
         r = request_with_retries(
             self.s, "POST", url,
             json={"email": self.email, "passwd": self.password},
@@ -66,7 +67,7 @@ class NovelpiaClient:
             pass
 
     def refresh(self) -> Optional[str]:
-        url = f"{API_BASE}/v1/login/refresh"
+        url = f"{const.API_BASE}/v1/login/refresh"
         r = request_with_retries(
             self.s, "GET", url,
             headers=merge_login_at({}, self.tokens.login_at),
@@ -77,15 +78,15 @@ class NovelpiaClient:
         # Persist refreshed token to config
         try:
             cfg: Dict[str, Any] = {}
-            if os.path.exists(CONFIG_PATH):
+            if os.path.exists(const.CONFIG_PATH):
                 try:
-                    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    with open(const.CONFIG_PATH, "r", encoding="utf-8") as f:
                         cfg = json.load(f) or {}
                 except Exception as e:
                     print(f"Error loading config: {e}")
                     cfg = {}
             cfg["login_at"] = self.tokens.login_at
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            with open(const.CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
                 pass
         except Exception as e:
@@ -93,40 +94,53 @@ class NovelpiaClient:
             pass
         return self.tokens.login_at
 
+    def _on_rate_limit(self):
+        """Increase throttle when 429 occurs."""
+        old = self.throttle
+        self.throttle = min(15.0, self.throttle + 2.0)
+        if const.HTTP_LOG:
+            print(f"[api] Increased throttle from {old}s to {self.throttle}s due to rate limit.")
+
     def me(self) -> Dict:
-        url = f"{API_BASE}/v1/login/me"
+        url = f"{const.API_BASE}/v1/login/me"
         r = request_with_retries(
             self.s, "GET", url,
             headers=merge_login_at({}, self.tokens.login_at),
-            timeout=self.timeout, allow_refresh=True, refresh_fn=self.refresh,
+            timeout=self.timeout, allow_refresh=True, 
+            refresh_fn=self.refresh, login_fn=self.login,
+            on_rate_limit=self._on_rate_limit
         )
         r.raise_for_status()
         return r.json()
 
     def novel(self, novel_id: int) -> Dict:
-        url = f"{API_BASE}/v1/novel"
+        url = f"{const.API_BASE}/v1/novel"
         r = request_with_retries(
             self.s, "GET", url,
             headers=merge_login_at({}, self.tokens.login_at),
             params={"novel_no": novel_id},
-            timeout=self.timeout, allow_refresh=True, refresh_fn=self.refresh,
+            timeout=self.timeout, allow_refresh=True, 
+            refresh_fn=self.refresh, login_fn=self.login,
+            on_rate_limit=self._on_rate_limit
         )
         r.raise_for_status()
         return r.json()
 
     def episode_list(self, novel_id: int, rows: int) -> Dict:
-        url = f"{API_BASE}/v1/novel/episode/list"
+        url = f"{const.API_BASE}/v1/novel/episode/list"
         r = request_with_retries(
             self.s, "GET", url,
             headers=merge_login_at({}, self.tokens.login_at),
             params={"novel_no": novel_id, "rows": rows, "sort": "ASC"},
-            timeout=self.timeout, allow_refresh=True, refresh_fn=self.refresh,
+            timeout=self.timeout, allow_refresh=True, 
+            refresh_fn=self.refresh, login_fn=self.login,
+            on_rate_limit=self._on_rate_limit
         )
         r.raise_for_status()
         return r.json()
 
     def episode_ticket(self, episode_no: int) -> Dict:
-        url = f"{API_BASE}/v1/novel/episode"
+        url = f"{const.API_BASE}/v1/novel/episode"
         headers = merge_login_at({}, self.tokens.login_at)
         params = {"episode_no": episode_no}
         # Throttle before hitting ticket endpoint to avoid rate limits
@@ -135,13 +149,15 @@ class NovelpiaClient:
         r = request_with_retries(
             self.s, "GET", url,
             headers=headers, params=params,
-            timeout=self.timeout, allow_refresh=True, refresh_fn=self.refresh, max_retries=4,
+            timeout=self.timeout, allow_refresh=True, 
+            refresh_fn=self.refresh, login_fn=self.login,
+            on_rate_limit=self._on_rate_limit, max_retries=4,
         )
         r.raise_for_status()
         return r.json()
 
     def episode_content(self, token_t: str) -> Dict:
-        url = f"{API_BASE}/v1/novel/episode/content"
+        url = f"{const.API_BASE}/v1/novel/episode/content"
         # Throttle content fetch too, to be safe
         if self.throttle:
             time.sleep(self.throttle + random.uniform(0.05, 0.25))
@@ -149,22 +165,107 @@ class NovelpiaClient:
             self.s, "GET", url,
             params={"_t": token_t},
             timeout=self.timeout, max_retries=3,
-            allow_refresh=True, refresh_fn=self.refresh,
+            allow_refresh=True, refresh_fn=self.refresh, login_fn=self.login,
+            on_rate_limit=self._on_rate_limit
         )
         r.raise_for_status()
         return r.json()
 
+    def fetch_episode(self, ep: Dict, idx: int = 0) -> Dict:
+        """Fetch ticket and content for a single episode."""
+        from src.helper import extract_t_token
+        from src.novel import html_from_episode_text
+        
+        epi_no = int(ep.get("episode_no"))
+        epi_title = ep.get("epi_title") or f"Episode {ep.get('epi_num')}"
+        
+        # 1) Ticket
+        try:
+            tdata = self.episode_ticket(epi_no)
+        except Exception as e:
+            return {"error": str(e), "epi_no": epi_no, "epi_title": epi_title, "idx": idx}
+
+        token_t, direct_url = extract_t_token(tdata)
+        if not token_t and not direct_url:
+            return {"error": "no token found", "epi_no": epi_no, "epi_title": epi_title, "idx": idx}
+
+        # 2) Content
+        try:
+            if token_t:
+                cdata = self.episode_content(token_t)
+            else:
+                r = self.s.get(direct_url, timeout=self.timeout)
+                r.raise_for_status()
+                cdata = r.json()
+        except Exception as e:
+            return {"error": str(e), "epi_no": epi_no, "epi_title": epi_title, "idx": idx}
+
+        # 3) Extract HTML
+        result_block = cdata.get("result", {})
+        data_block = result_block.get("data", {}) if isinstance(result_block, dict) else {}
+
+        parts = []
+        try:
+            def _key(k: str):
+                import re as _re
+                m = _re.search(r"(\d+)$", k)
+                return (0 if k == "epi_content" else 1, int(m.group(1)) if m else 0)
+            for k in sorted([kk for kk in data_block.keys() if str(kk).startswith("epi_content")], key=_key):
+                v = data_block.get(k)
+                if isinstance(v, str) and v:
+                    parts.append(v)
+        except Exception:
+            pass
+
+        html_text = "".join(parts).strip()
+        if not html_text:
+            html_text = (
+                result_block.get("content")
+                or result_block.get("html")
+                or result_block.get("text")
+                or cdata.get("content")
+                or ""
+            )
+
+        return {
+            "html": html_from_episode_text(html_text),
+            "epi_title": epi_title,
+            "epi_no": epi_no,
+            "idx": idx,
+        }
+
+    def fetch_episodes_parallel(self, ep_list: List[Dict], max_workers: int = 4, progress_cb=None) -> List[Dict]:
+        """Fetch multiple episodes in parallel."""
+        results = [None] * len(ep_list)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(self.fetch_episode, ep, i+1): i 
+                for i, ep in enumerate(ep_list)
+            }
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    res = future.result()
+                    results[idx] = res
+                except Exception as e:
+                    results[idx] = {"error": str(e), "idx": idx+1}
+                if progress_cb:
+                    progress_cb()
+        return results
+
 def request_with_retries(session: requests.Session, method: str, url: str, *,
                           headers=None, params=None, json=None, data=None,
                           timeout=30, max_retries=3, backoff=1.25,
-                          allow_refresh=False, refresh_fn=None):
-    """Generic request wrapper: retries on 5xx and network issues.
+                          allow_refresh=False, refresh_fn=None,
+                          login_fn=None, on_rate_limit=None):
+    """Generic request wrapper: retries on 5xx, 429, and network issues.
     If allow_refresh is True and the response indicates an expired token, invoke
-    refresh_fn() once and then retry the original request exactly once.
+    refresh_fn() followed by login_fn() if needed, then retry.
     """
     attempt = 0
     last_exc = None
     did_refresh = False
+    did_login = False
     while attempt < max_retries:
         attempt += 1
         try:
@@ -176,9 +277,8 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
                 print(f"Error occurred while attaching auth cookies: {e}")
                 pass
 
-            if HTTP_LOG:
+            if const.HTTP_LOG:
                 print(f"[api] -> {method} {url} (attempt {attempt}/{max_retries})")
-                # Effective headers (session defaults + per-call overrides)
                 try:
                     eff_headers = {}
                     try:
@@ -195,95 +295,72 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
                     print(f"[api]    params:  {_j(_mask_kv(params))}")
                 if json is not None:
                     print(f"[api]    json:    {_j(_mask_kv(json))}")
-                if data is not None and not json:
-                    # data may be bytes/str; keep short
-                    d = data if isinstance(data, (str, bytes)) else _j(_mask_kv(data))
-                    if isinstance(d, bytes):
-                        d = d[:128] + b"..." if len(d) > 128 else d
-                        try:
-                            d = d.decode("utf-8", "ignore")
-                        except Exception:
-                            d = "<bytes>"
-                    print(f"[api]    data:    {d if isinstance(d, str) else str(d)}")
 
             r = session.request(method, url, headers=headers, params=params, json=json, data=data, timeout=timeout)
+            
+            # Handle rate limiting (429)
+            if r.status_code == 429:
+                if on_rate_limit:
+                    on_rate_limit()
+                wait = max(5.0, backoff ** (attempt + 2)) + random.uniform(0.5, 1.5)
+                if const.HTTP_LOG:
+                    print(f"[api] !! Rate limit (429) hit. Waiting {wait:.1f}s...")
+                time.sleep(wait)
+                continue
+
             # Handle auth refresh-and-retry for all endpoints except login/refresh
-            if allow_refresh and refresh_fn and not did_refresh:
-                try:
-                    trigger_refresh = False
-                    # Status-based hint
-                    if getattr(r, "status_code", None) in (401, 403):
+            if allow_refresh and (refresh_fn or login_fn) and not did_login:
+                trigger_refresh = False
+                if r.status_code in (401, 403):
+                    trigger_refresh = True
+                else:
+                    msg = ""
+                    try:
+                        body = r.json()
+                        msg = (body.get("errmsg") or body.get("message") or "").lower()
+                    except Exception:
+                        pass
+                    if "token" in msg and "expire" in msg:
                         trigger_refresh = True
-                    else:
-                        # Body-message based hint (robust to minor variations)
-                        msg = None
-                        try:
-                            body = r.json()
-                            if isinstance(body, dict):
-                                msg = body.get("errmsg") or body.get("message")
-                        except Exception as e:
-                            print(f"Error occurred while parsing response body: {e}")
+
+                if trigger_refresh:
+                    try:
+                        success = False
+                        # Try refresh first
+                        if refresh_fn and not did_refresh:
+                            if const.HTTP_LOG: print("[api] Session expired, trying refresh...")
                             try:
-                                msg = r.text
-                            except Exception as e:
-                                print(f"Error occurred while fetching response text: {e}")
-                                msg = None
-                        if isinstance(msg, str):
-                            s = msg.lower()
-                            if ("token" in s and "expire" in s) or ("the token has expired" in s):
-                                trigger_refresh = True
-                    if trigger_refresh:
-                        try:
-                            # Perform refresh; allow refresh_fn to return the new token
-                            new_login_at = None
-                            try:
-                                new_login_at = refresh_fn()
-                            except TypeError:
-                                # Backward compatibility if refresh_fn returns nothing
                                 refresh_fn()
-                                new_login_at = None
-                            did_refresh = True
-                            # If we got a new token, update headers for retry
-                            if new_login_at:
-                                if headers is None:
-                                    headers = {"login-at": new_login_at}
-                                else:
-                                    headers = dict(headers)
-                                    headers["login-at"] = new_login_at
-                            # Re-inject Cookie header from updated session cookies before retry
-                            try:
-                              attach_auth_cookies(session, headers)
+                                did_refresh = True
+                                success = True
                             except Exception:
-                                print(f"Error occurred while preparing cookies for retry: {e}")
-                                pass
-                            # Retry original request once after successful refresh (with possibly updated headers)
+                                if const.HTTP_LOG: print("[api] Refresh failed.")
+                        
+                        # Try full login if refresh failed or not available
+                        if not success and login_fn and not did_login:
+                            if const.HTTP_LOG: print("[api] Refresh failed or unavailable, trying full re-login...")
+                            try:
+                                login_fn()
+                                did_login = True
+                                success = True
+                            except Exception as e:
+                                if const.HTTP_LOG: print(f"[api] Re-login failed: {e}")
+
+                        if success:
+                            # Retry original request once
                             r = session.request(method, url, headers=headers, params=params, json=json, data=data, timeout=timeout)
-                        except Exception as e:
-                            print(f"Error occurred during refresh logic: {e}")
-                            pass
-                except Exception as e:
-                    print(f"Error occurred during refresh logic: {e}")
-                    pass
-            if HTTP_LOG:
-                body_preview = None
-                try:
-                    t = r.text
-                    body_preview = (t[:500] + "…") if len(t) > 500 else t
-                except Exception:
-                    body_preview = "<non-text body>"
+                    except Exception as e:
+                        if const.HTTP_LOG: print(f"[api] Auth recovery failed: {e}")
+
+            if const.HTTP_LOG:
                 print(f"[api] <- {r.status_code} {r.reason} from {r.url}")
-                try:
-                    print(f"[api]    resp-headers: {_j(_mask_kv(dict(r.headers))) }")
-                except Exception:
-                    print("[api]    resp-headers: <unavailable>")
-                if body_preview is not None:
-                    print(f"[api]    body: {body_preview}")
+            
             if r.status_code >= 500 and attempt < max_retries:
                 time.sleep(backoff ** attempt)
                 continue
             return r
         except requests.RequestException as e:
-            if HTTP_LOG:
+            if const.HTTP_LOG:
                 print(f"[api] !! {method} {url} failed on attempt {attempt}: {e}")
             last_exc = e
             if attempt < max_retries:
