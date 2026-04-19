@@ -9,9 +9,13 @@ Create a clean EPUB from a Novelpia novel using Novelpia’s API. Given a `novel
 ## Features
 
 * API-based fetch (no browser automation).
+* **Parallel Fetching**: Uses `ThreadPoolExecutor` for high-performance concurrent chapter downloads.
+* **Progress Reporting**: Real-time visual feedback with `tqdm` progress bars.
+* **Flexible Chapter Selection**: Support for downloading specific chapter ranges (`--start`/`--end`).
+* **Environment Variable Support**: Securely store credentials in a `.env` file via `python-dotenv`.
+* **Advanced Automation**: Automatically handles rate limits (429) with smart backoff and session expiration (401) with auto re-login.
 * Proper EPUB with cover, About page, per‑chapter files, ToC, NCX/Nav.
 * Preserves inline images (downloaded and embedded).
-* Handles token refresh and optional throttling to reduce rate limits.
 
 ---
 
@@ -28,7 +32,7 @@ Create a clean EPUB from a Novelpia novel using Novelpia’s API. Given a `novel
 ## Requirements
 
 * Python 3.9+
-* Packages: `requests`, `beautifulsoup4`, `ebooklib`
+* Packages: `requests`, `beautifulsoup4`, `ebooklib`, `tqdm`, `python-dotenv`
 
 Install packages:
 
@@ -43,8 +47,9 @@ pip install -r requirements.txt
 ```
 python main.py NOVEL_ID [--user EMAIL] [--pass PASSWORD]
                    [--out DIR] [--max-chapters N]
+                   [--start START_CHAPTER] [--end END_CHAPTER]
                    [--lang en] [--proxy URL] [--throttle SECONDS]
-                   [--debug]
+                   [--debug] [--txt]
 ```
 
 Arguments
@@ -53,11 +58,13 @@ Arguments
 * `--user`, `--pass` — login once; tokens saved to `.api.json` for reuse.
 * `--out` — output directory (default: `output`).
 * `--max-chapters` — fetch up to N episodes (0 or unset = all).
+* `--start`, `--start-chapter` — start fetching from this chapter number.
+* `--end`, `--end-chapter` — stop fetching at this chapter number.
 * `--lang` — EPUB language code (default `en`).
 * `--proxy` — HTTP/HTTPS proxy, e.g. `http://host:port`.
 * `--throttle` — seconds to wait between episode/ticket/content calls (default `2.0`).
 * `--debug` — verbose request logs and optional JSON dumps for failures.
-* `--txt` — export as txt per episode
+* `--txt` — export as .txt per episode instead of EPUB.
 
 ---
 
@@ -74,6 +81,15 @@ python main.py 49 --user you@example.com --pass "your-password"
 ```bash
 python main.py 49
 ```
+
+### Environment Variables (.env)
+You can create a `.env` file in the root directory to store your credentials securely:
+
+```env
+NOVELPIA_EMAIL=your_email@example.com
+NOVELPIA_PASSWORD=your_password
+```
+A template is provided in `.env.example`.
 
 ---
 
@@ -103,8 +119,8 @@ output/<title>/<title>.epub or output/<title>/<episode-title>.txt
 
 ## Tips & Troubleshooting
 
-* 401/expired token — add `--user` and `--pass` once to refresh; tokens are persisted.
-* Many 429/5xx responses — increase `--throttle` or add `--proxy`.
+* **Auto-Recovery**: 401/expired tokens are now automatically handled if credentials are found in `.env` or provided via CLI.
+* **Smart Backoff**: 429/Rate limits trigger an automatic exponential backoff and dynamic throttle adjustment.
 * Missing images — some external hosts may block requests; those images will remain as external links.
 * HTTP debug — pass `--debug` to print masked headers/params and short body previews.
 
