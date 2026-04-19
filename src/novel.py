@@ -1,7 +1,5 @@
-import requests
-
 from bs4 import BeautifulSoup
-from src.helper import extract_t_token, normalize_url
+from src.helper import normalize_url
 
 # ----------------------------
 # Novelpia Novel & Episodes Fetcher
@@ -50,6 +48,11 @@ def fetch_novel_and_episodes(client, novel_id, start_chapter=None, end_chapter=N
     nv = data_novel["result"]["novel"]
     title = nv.get("novel_name", f"novel_{novel_id}")
     epi_cnt = data_novel["result"].get("info", {}).get("epi_cnt") or nv.get("count_epi") or 0
+    writers = data_novel["result"].get("writer_list") or []
+    author = (writers[0].get("writer_name") if writers and writers[0].get("writer_name") else "Unknown Author")
+    status = "Completed" if str(nv.get("flag_complete", 0)) == "1" else "Ongoing"
+    
+    print(f"[info] title='{title}' author='{author}' chapter={epi_cnt} status={status}")
 
     rows = int(epi_cnt) if epi_cnt else 1000
     data_list = client.episode_list(novel_id, rows=rows)
@@ -64,4 +67,4 @@ def fetch_novel_and_episodes(client, novel_id, start_chapter=None, end_chapter=N
     if max_chapters:
         ep_list = ep_list[:int(max_chapters)]
 
-    return data_novel, ep_list, title
+    return data_novel, ep_list, title

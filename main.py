@@ -1,8 +1,8 @@
 import argparse
 import sys
 import os
-from dotenv import load_dotenv
 
+from dotenv import load_dotenv
 from src.api import NovelpiaClient
 from src.builder import build_epub, build_txt
 from src.helper import load_config, save_config
@@ -41,8 +41,7 @@ def main():
     password = args.password or os.getenv("NOVELPIA_PASSWORD")
 
     if email and password:
-        client = NovelpiaClient(email=email, password=password, proxy=args.proxy,
-                                throttle=args.throttle, userkey=cfg_userkey, tkey=cfg_tkey)
+        client = NovelpiaClient(email=email, password=password, proxy=args.proxy, throttle=args.throttle, userkey=cfg_userkey, tkey=cfg_tkey)
         client.login()
         # Persist/refresh tokens after successful login
         userkey_val = None
@@ -62,8 +61,7 @@ def main():
             "tkey": tkey_val or client.tokens.tkey or cfg_tkey or "",
         })
     elif cfg_login_at and cfg_userkey:
-        client = NovelpiaClient(email=None, password=None, proxy=args.proxy,
-                                throttle=args.throttle, userkey=cfg_userkey, tkey=cfg_tkey)
+        client = NovelpiaClient(email=None, password=None, proxy=args.proxy, throttle=args.throttle, userkey=cfg_userkey, tkey=cfg_tkey)
         client.tokens.login_at = cfg_login_at
     else:
         print("[error] No credentials or stored tokens found. Provide --user and --pass to login once.")
@@ -79,7 +77,6 @@ def main():
                 language=args.lang, debug_dump=args.debug,
             )
             print(f"\n[success] Wrote TXT files under: {out_dir_final}")
-            print(f"          Title: {title}  |  Chapters: {count}")
         else:
             out_file, title, count = build_epub(
                 client, args.novel_id, args.out,
@@ -89,7 +86,6 @@ def main():
                 language=args.lang, debug_dump=args.debug
             )
             print(f"\n[success] Wrote EPUB: {out_file}")
-            print(f"          Title: {title}  |  Chapters: {count}")
     except Exception as e:
         print(f"[error] Failed to build novel: {e}")
         sys.exit(1)

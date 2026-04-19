@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import re
+
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urljoin, urlparse
 import requests
@@ -108,7 +109,7 @@ def _mask_value(v: Any) -> Any:
     except Exception:
         return "<masked>"
 
-def _mask_kv(d: Optional[dict]) -> Optional[dict]:
+def mask_kv(d: Optional[dict]) -> Optional[dict]:
     if not isinstance(d, dict):
         return d
     out = {}
@@ -123,7 +124,7 @@ def _mask_kv(d: Optional[dict]) -> Optional[dict]:
             out[k] = _mask_value(v)
     return out
 
-def _j(x: Any) -> str:
+def j(x: Any) -> str:
     try:
         return json.dumps(x, ensure_ascii=False)
     except Exception:
@@ -159,29 +160,6 @@ def attach_auth_cookies(session, headers=None):
             headers.setdefault("Cookie", "; ".join(cookie_parts))
 
         return headers
-
-# ----------------------------
-# Error message extraction
-# ----------------------------
-
-def _extract_errmsg_from_response(resp: Optional[requests.Response]) -> str:
-    try:
-        if resp is None:
-            return ""
-        try:
-            data = resp.json()
-            if isinstance(data, dict):
-                em = data.get("errmsg") or (
-                    isinstance(data.get("result"), dict) and data["result"].get("message")
-                ) or None
-                if isinstance(em, str) and em.strip():
-                    return em.strip()
-        except Exception:
-            pass
-        txt = getattr(resp, "text", "") or ""
-        return txt.strip()
-    except Exception:
-        return ""
 
 # ----------------------------
 # Token extraction (STRICT)

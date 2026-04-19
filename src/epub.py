@@ -1,7 +1,5 @@
 import html
-import json
 import os
-import requests
 import time
 
 from typing import Dict, List, Optional, Tuple
@@ -11,8 +9,7 @@ from ebooklib import epub
 from tqdm import tqdm
 from src.api import NovelpiaClient
 from src.const import BASE_URL
-from src.helper import ensure_dir, extract_t_token, kebab, media_type_from_ext, normalize_url
-from src.novel import html_from_episode_text
+from src.helper import ensure_dir, kebab, media_type_from_ext, normalize_url
 
 # ----------------------------
 # EPUB Builder
@@ -43,7 +40,7 @@ class EpubBuilder:
     def build(self, client: NovelpiaClient, novel: Dict, episodes: List[Dict],
               filename_hint: Optional[str] = None, language: str = "en",
               author_fallback: str = "Unknown", css_text: Optional[str] = None,
-              novel_id: Optional[int] = None) -> str:
+              novel_id: Optional[int] = None) -> Tuple[str, str, int]:
         nv = novel["result"]["novel"]
         title = nv.get("novel_name", f"novel_{nv.get('novel_no','')}")
         writers = novel["result"].get("writer_list") or []
@@ -180,7 +177,7 @@ class EpubBuilder:
         toc.insert(0, about)
 
         # TOC, NCX, Nav
-        book.toc = tuple(toc)
+        book.toc = toc
         book.add_item(epub.EpubNcx())
         book.add_item(epub.EpubNav())
 

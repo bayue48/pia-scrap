@@ -5,11 +5,14 @@ import time
 import uuid
 import requests
 import concurrent.futures
+import re as _re
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from src import const
-from src.helper import _j, _mask_kv, attach_auth_cookies, merge_login_at
+from src.helper import j, mask_kv, attach_auth_cookies, merge_login_at
+from src.helper import extract_t_token
+from src.novel import html_from_episode_text
 
 # ----------------------------
 # API Client
@@ -23,7 +26,7 @@ class Tokens:
 
 class NovelpiaClient:
     def __init__(self, email: Optional[str] = None, password: Optional[str] = None,
-                 proxy: Optional[str] = None, timeout: int = 30, throttle: float = 2.0,
+                 proxy: Optional[str] = None, timeout: int = 30, throttle: float = 1.5,
                  userkey: Optional[str] = None, tkey: Optional[str] = None):
         self.s = requests.Session()
         self.s.headers.update(const.SESSION_HEADERS.copy())
@@ -34,7 +37,7 @@ class NovelpiaClient:
         self.email = email
         self.password = password
         # delay seconds between episode-related API calls to reduce 429/500 rate limits
-        self.throttle = max(0.0, float(throttle or 0.0))
+        self.throttle = max(0.0, float(throttle or 1.5))
         try:
             if not userkey:
                 userkey = uuid.uuid4().hex
@@ -97,7 +100,7 @@ class NovelpiaClient:
     def _on_rate_limit(self):
         """Increase throttle when 429 occurs."""
         old = self.throttle
-        self.throttle = min(15.0, self.throttle + 2.0)
+        self.throttle = min(15.0, self.throttle + 1.5)
         if const.HTTP_LOG:
             print(f"[api] Increased throttle from {old}s to {self.throttle}s due to rate limit.")
 
@@ -145,7 +148,7 @@ class NovelpiaClient:
         params = {"episode_no": episode_no}
         # Throttle before hitting ticket endpoint to avoid rate limits
         if self.throttle:
-            time.sleep(self.throttle + random.uniform(0.05, 0.25))
+            time.sleep(self.throttle + random.uniform(1.0, 1.5))
         r = request_with_retries(
             self.s, "GET", url,
             headers=headers, params=params,
@@ -160,7 +163,7 @@ class NovelpiaClient:
         url = f"{const.API_BASE}/v1/novel/episode/content"
         # Throttle content fetch too, to be safe
         if self.throttle:
-            time.sleep(self.throttle + random.uniform(0.05, 0.25))
+            time.sleep(self.throttle + random.uniform(1.0, 1.5))
         r = request_with_retries(
             self.s, "GET", url,
             params={"_t": token_t},
@@ -173,10 +176,15 @@ class NovelpiaClient:
 
     def fetch_episode(self, ep: Dict, idx: int = 0) -> Dict:
         """Fetch ticket and content for a single episode."""
-        from src.helper import extract_t_token
-        from src.novel import html_from_episode_text
-        
-        epi_no = int(ep.get("episode_no"))
+        episode_no = ep.get("episode_no")
+        if episode_no is None:
+            return {
+                "error": "missing episode_no",
+                "epi_no": None,
+                "epi_title": ep.get("epi_title") or f"Episode {ep.get('epi_num')}",
+                "idx": idx,
+            }
+        epi_no = int(episode_no)
         epi_title = ep.get("epi_title") or f"Episode {ep.get('epi_num')}"
         
         # 1) Ticket
@@ -194,6 +202,7 @@ class NovelpiaClient:
             if token_t:
                 cdata = self.episode_content(token_t)
             else:
+                assert direct_url is not None, "direct_url unavailable"
                 r = self.s.get(direct_url, timeout=self.timeout)
                 r.raise_for_status()
                 cdata = r.json()
@@ -207,7 +216,6 @@ class NovelpiaClient:
         parts = []
         try:
             def _key(k: str):
-                import re as _re
                 m = _re.search(r"(\d+)$", k)
                 return (0 if k == "epi_content" else 1, int(m.group(1)) if m else 0)
             for k in sorted([kk for kk in data_block.keys() if str(kk).startswith("epi_content")], key=_key):
@@ -234,9 +242,9 @@ class NovelpiaClient:
             "idx": idx,
         }
 
-    def fetch_episodes_parallel(self, ep_list: List[Dict], max_workers: int = 4, progress_cb=None) -> List[Dict]:
+    def fetch_episodes_parallel(self, ep_list: List[Dict[str, Any]], max_workers: int = 3, progress_cb=None) -> List[Dict[str, Any]]:
         """Fetch multiple episodes in parallel."""
-        results = [None] * len(ep_list)
+        results: List[Dict[str, Any]] = [{} for _ in range(len(ep_list))]
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {
                 executor.submit(self.fetch_episode, ep, i+1): i 
@@ -278,7 +286,7 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
                 pass
 
             if const.HTTP_LOG:
-                print(f"[api] -> {method} {url} (attempt {attempt}/{max_retries})")
+                print(f"[api]   -> {method} {url} (attempt {attempt}/{max_retries})")
                 try:
                     eff_headers = {}
                     try:
@@ -288,15 +296,18 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
                         pass
                     if headers:
                         eff_headers.update(headers)
-                    print(f"[api]    req-headers: {_j(_mask_kv(eff_headers))}")
                 except Exception as e:
-                    print(f"[api]    req-headers: <unavailable> ({e})")
+                    print(f"[api]   req-headers: <unavailable> ({e})")
                 if params:
-                    print(f"[api]    params:  {_j(_mask_kv(params))}")
+                    print(f"[api]   params:  {j(mask_kv(params))}")
                 if json is not None:
-                    print(f"[api]    json:    {_j(_mask_kv(json))}")
+                    print(f"[api]   json:    {j(mask_kv(json))}")
 
             r = session.request(method, url, headers=headers, params=params, json=json, data=data, timeout=timeout)
+
+            if const.HTTP_LOG and r.status_code != 200:
+                print(f"[api]   <- {r.status_code} {r.reason} from {r.url}")
+                print(f"[api]   <- Response content: {r.text}")
             
             # Handle rate limiting (429)
             if r.status_code == 429:
@@ -305,6 +316,16 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
                 wait = max(5.0, backoff ** (attempt + 2)) + random.uniform(0.5, 1.5)
                 if const.HTTP_LOG:
                     print(f"[api] !! Rate limit (429) hit. Waiting {wait:.1f}s...")
+                time.sleep(wait)
+                continue
+
+            # Handle too many requests or server errors (5xx)
+            if r.status_code >= 500:
+                if on_rate_limit:
+                    on_rate_limit()
+                wait = max(5.0, backoff ** (attempt + 2)) + random.uniform(0.5, 1.5)
+                if const.HTTP_LOG:
+                    print(f"[api] !! Server error ({r.status_code}). Retrying after backoff...")
                 time.sleep(wait)
                 continue
 
@@ -352,10 +373,7 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
                     except Exception as e:
                         if const.HTTP_LOG: print(f"[api] Auth recovery failed: {e}")
 
-            if const.HTTP_LOG:
-                print(f"[api] <- {r.status_code} {r.reason} from {r.url}")
-            
-            if r.status_code >= 500 and attempt < max_retries:
+            if r.json and r.status_code >= 500 and attempt < max_retries:
                 time.sleep(backoff ** attempt)
                 continue
             return r
