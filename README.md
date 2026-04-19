@@ -95,6 +95,11 @@ A template is provided in `.env.example`.
 
 ## Output Details
 
+Alongside the EPUB, the tool writes:
+
+* `metadata.json` — title, author, tags (when available), total chapters, status, description, source URL.
+* `chapters.jsonl` — one JSON line per chapter: index, title, URL of the web reader for that episode.
+
 Output files are written under `output/<title>/`:
 
 ```
